@@ -13,7 +13,9 @@ Facebook Graph API Client
 from __future__ import annotations
 
 import asyncio
+import os
 import random
+import re
 import time
 from typing import Optional, Dict, Any
 
@@ -165,24 +167,34 @@ class FacebookAPIClient:
 
                 # ── معالجة ردود non-JSON ──
                 content_type = resp.headers.get('content-type', '')
+                raw_text = resp.text or ''
                 if 'application/json' not in content_type and 'text/javascript' not in content_type:
                     # Facebook أحياناً يرجع HTML لو الجلسة منتهية
                     if resp.status_code in (401, 403):
                         return {'success': False,
                                 'error': 'انتهت صلاحية الكوكيز أو غير مصرح (401/403)',
-                                'raw': resp.text[:200]}
-                    if 'login' in resp.text.lower() or 'checkpoint' in resp.text.lower():
+                                'raw': raw_text[:200]}
+                    if 'login' in raw_text.lower() or 'checkpoint' in raw_text.lower():
                         return {'success': False,
                                 'error': 'فيسبوك طلب تسجيل دخول — تحقق من الكوكيز',
-                                'raw': resp.text[:200]}
+                                'raw': raw_text[:200]}
 
                 try:
                     data = resp.json()
                 except Exception:
+                    snippet = (raw_text[:300] or '(فارغ)').strip()
+                    # نطبع الـ raw response فى لوج البوت لتسهيل التشخيص
+                    print(f'[FB non-JSON] {method} {endpoint} -> HTTP {resp.status_code}')
+                    print(f'[FB non-JSON] content-type: {content_type}')
+                    print(f'[FB non-JSON] body[:500]: {raw_text[:500]}')
                     return {
                         'success': False,
-                        'error':   f'رد غير JSON من Facebook (HTTP {resp.status_code})',
-                        'raw':     resp.text[:300],
+                        'error':   (
+                            f'رد غير JSON من Facebook (HTTP {resp.status_code}).\n'
+                            f'Content-Type: {content_type or "?"}\n'
+                            f'مقتطف: {snippet[:220]}'
+                        ),
+                        'raw':     raw_text[:1000],
                     }
 
                 if resp.status_code != 200 or 'error' in data:
@@ -234,6 +246,131 @@ class FacebookAPIClient:
             'data':             r['data'],
             'whatsapp_number':  r['data'].get('whatsapp_number', ''),
         }
+
+    async def resolve_post_link(self, link_or_id: str) -> Dict[str, Any]:
+        """
+        من رابط/معرف بوست فيسبوك، يستخرج (page_id, post_id).
+        post_id المُرجَع "خام" (بدون بادئة page_id_) لأن
+        create_ad_creative_post بيبنى object_story_id بالشكل page_id_post_id.
+
+        الترتيب:
+        1) صيغة pageId_postId مباشرة من المستخدم.
+        2) URL فيه page_id + post_id (الأكثر موثوقية، بدون أى API).
+        3) URL فيه post_id فقط، أو رقم خام → fallback على Graph API
+           (قد يفشل لو البوست status أو pfbid).
+        """
+        text = (link_or_id or '').strip()
+        if not text:
+            return {'success': False, 'error': 'الرابط أو معرف البوست فارغ'}
+
+        # 1) صيغة "pageId_postId" — رجّع post_id خام
+        m = re.match(r'^(\d+)_(\w+)$', text)
+        if m:
+            return {'success': True, 'page_id': m.group(1), 'post_id': m.group(2)}
+
+        # 2) محاولة استخراج page_id و post_id من URL
+        page_id_from_url: Optional[str] = None
+        post_id_from_url: Optional[str] = None
+
+        m = re.search(r'(?:^|[?&])id=(\d+)', text)
+        if m:
+            page_id_from_url = m.group(1)
+        else:
+            m = re.search(r'facebook\.com/(\d{10,20})/(?:posts|videos|photos|reels)', text)
+            if m:
+                page_id_from_url = m.group(1)
+
+        url_patterns = [
+            r'/posts/(pfbid\w+)',
+            r'/posts/(\d+)',
+            r'story_fbid=(pfbid\w+|\d+)',
+            r'/videos/(\d+)',
+            r'/reel/(\d+)',
+            r'fbid=(\d+)',
+            r'/permalink/(\d+)',
+            r'/(\d{10,30})/?(?:\?|$)',
+        ]
+        for p in url_patterns:
+            m = re.search(p, text)
+            if m:
+                post_id_from_url = m.group(1)
+                break
+
+        # 2-أ) الاتنين موجودين فى URL → نثق بيهم بدون استعلام (الأفضل)
+        # FB ad creative بيقبل page_id_pfbid... وبيقبل page_id_<numeric>
+        if page_id_from_url and post_id_from_url:
+            return {
+                'success': True,
+                'page_id': page_id_from_url,
+                'post_id': post_id_from_url,
+            }
+
+        # 3) رقم خام أو URL ناقص → استعلام Graph API
+        if re.match(r'^\d{6,30}$', text):
+            return await self._resolve_via_api(text)
+        if post_id_from_url:
+            return await self._resolve_via_api(post_id_from_url)
+
+        return {'success': False, 'error': 'تعذّر استخراج معرف البوست من الرابط'}
+
+    async def _resolve_via_api(self, post_id: str) -> Dict[str, Any]:
+        """
+        يسأل Graph API عن البوست لاستخراج page_id والـ post_id الخام.
+        قد يفشل بـ #12 لو البوست status — فى الحالة دى لازم URL يحتوى page_id.
+        """
+        r = await self._request('GET', post_id, params={'fields': 'id,from'})
+        if not r['success']:
+            return {
+                'success': False,
+                'error': f'فشل التحقق من البوست عبر Facebook: {r.get("error")}',
+            }
+        data = r.get('data', {}) or {}
+        from_obj = data.get('from') or {}
+        page_id = from_obj.get('id')
+        full_post_id = data.get('id') or post_id
+        if not page_id:
+            return {
+                'success': False,
+                'error': 'لم يُعثر على معرف الصفحة (from) فى رد Facebook — تأكد أن الرابط لمنشور صفحة.',
+            }
+        # full_post_id = "pageId_postId" → نستخرج post_id الخام
+        bare_post_id = full_post_id
+        if full_post_id.startswith(f'{page_id}_'):
+            bare_post_id = full_post_id.split('_', 1)[1]
+        return {'success': True, 'page_id': page_id, 'post_id': bare_post_id}
+
+    async def check_page_can_create_content(self, page_id: str) -> Dict[str, Any]:
+        """
+        تحقق من إن المستخدم عنده صلاحية إنشاء منشورات جديدة على الصفحة
+        (Content Creator أو أعلى). ضروري لإعلانات الدارك بوست.
+        المعلن فقط (ADVERTISE) مش كفاية.
+        """
+        r = await self._request(
+            'GET', page_id,
+            params={'fields': 'name,tasks'}
+        )
+        if not r['success']:
+            return r
+        tasks = r['data'].get('tasks', []) or []
+        # الصلاحيات اللى تسمح بإنشاء محتوى جديد
+        ALLOWED = {'CREATE_CONTENT', 'MANAGE', 'MODERATE', 'EDIT_PROFILE'}
+        if not any(t in ALLOWED for t in tasks):
+            tasks_label = '، '.join(tasks) if tasks else 'لا توجد'
+            return {
+                'success': False,
+                'error': (
+                    'دورك على هذه الصفحة لا يسمح بإنشاء منشورات جديدة (الدارك بوست).\n\n'
+                    f'الصلاحيات الحالية: {tasks_label}\n\n'
+                    'الدارك بوست يتطلّب دور <b>Content Creator</b> أو أعلى — '
+                    'دور "معلن فقط" غير كافٍ.\n\n'
+                    '<b>حلول مقترحة:</b>\n'
+                    '• استخدم بوابة "إعلان رابط بوست" بدلاً من الدارك بوست — '
+                    'لتعزيز منشور موجود مسبقاً على الصفحة (يعمل بصلاحية المعلن).\n'
+                    '• اطلب من مدير الصفحة رفع صلاحيتك إلى Content Creator.'
+                ),
+                'tasks': tasks,
+            }
+        return {'success': True, 'tasks': tasks}
 
     # ─────────────── حملة ───────────────
 
@@ -319,8 +456,81 @@ class FacebookAPIClient:
 
     # ─────────────── Creative ───────────────
 
+    async def upload_ad_image(self, ad_account_id: str,
+                              image_path: str) -> Dict[str, Any]:
+        """
+        رفع صورة على مستوى الـ Ad Account (Marketing API).
+        ده الـ endpoint الصحيح لإعلانات الدارك بوست — بيشتغل بكوكيز المستخدم
+        وبيرجع image_hash يستخدم فى creative.photo_data.image_hash.
+        """
+        if not ad_account_id or not str(ad_account_id).strip().isdigit() or int(ad_account_id) <= 0:
+            return {'success': False,
+                    'error': 'Ad Account ID غير صالح'}
+
+        with open(image_path, 'rb') as f:
+            image_data = f.read()
+        file_name = os.path.basename(image_path) or 'image.jpg'
+
+        # Headers لرفع الصور: نتجنب Accept-Encoding: br لتفادى أخطاء فك الضغط،
+        # ونزيل Content-Type لو موجود (httpx بيحدده تلقائياً للـ multipart).
+        headers = self._get_headers()
+        headers['Accept-Encoding'] = 'gzip, deflate'
+        headers.pop('Content-Type', None)
+
+        async with httpx.AsyncClient(
+            timeout=120, proxies=self.proxies, follow_redirects=True
+        ) as client:
+            resp = await client.post(
+                f'{self.base_url}/act_{ad_account_id}/adimages',
+                headers=headers,
+                cookies=self.cookies_dict,
+                files={'source': (file_name, image_data, 'image/jpeg')},
+            )
+            raw_text = resp.text
+            try:
+                data = resp.json()
+            except Exception:
+                # نطبع الـ raw response فى لوج البوت لتسهيل التشخيص
+                snippet = raw_text[:300] if raw_text else '(فارغ)'
+                print(f'[upload_ad_image] non-JSON HTTP {resp.status_code}: {snippet}')
+                return {'success': False,
+                        'error': (
+                            f'رد غير JSON من Facebook عند رفع الصورة (HTTP {resp.status_code}).\n'
+                            f'مقتطف: {snippet[:200]}'
+                        )}
+
+            if resp.status_code == 200 and isinstance(data.get('images'), dict) and data['images']:
+                first_key = next(iter(data['images']))
+                img = data['images'][first_key]
+                image_hash = img.get('hash')
+                if image_hash:
+                    return {'success': True, 'image_hash': image_hash, 'data': data}
+
+            err_obj = data.get('error', {}) if isinstance(data, dict) else {}
+            err_msg = err_obj.get('message') or err_obj.get('error_user_msg') or f'HTTP {resp.status_code}'
+            err_code = err_obj.get('code')
+
+            if err_code == 100 or 'does not resolve to a valid user' in str(err_msg).lower():
+                return {
+                    'success': False,
+                    'error': (
+                        'الكوكيز لا تمتلك صلاحية الرفع على هذا الحساب الإعلاني.\n'
+                        '• تأكد أن Ad Account ID يخص نفس الحساب المسجَّل بالكوكيز\n'
+                        '• تأكد أن الكوكيز حديثة وغير منتهية\n'
+                        '• تأكد أن لديك صلاحية على الحساب الإعلاني'
+                    ),
+                    'fb_code': err_code,
+                }
+            return {'success': False, 'error': f'[{err_code}] {err_msg}' if err_code else err_msg,
+                    'fb_code': err_code}
+
     async def upload_photo(self, page_id: str, image_path: str,
                            caption: str) -> Dict[str, Any]:
+        # تحقق من صلاحية Page ID قبل إرسال الطلب
+        if not page_id or not str(page_id).strip().isdigit() or int(page_id) <= 0:
+            return {'success': False,
+                    'error': 'Page ID غير صالح — تحقق من معرف الصفحة وأعد المحاولة'}
+
         with open(image_path, 'rb') as f:
             image_data = f.read()
         async with httpx.AsyncClient(
@@ -340,8 +550,25 @@ class FacebookAPIClient:
                         'error': f'رد غير JSON عند رفع الصورة (HTTP {resp.status_code})'}
             if resp.status_code == 200 and 'id' in data:
                 return {'success': True, 'photo_id': data['id'], 'data': data}
-            err = data.get('error', {}).get('message', f'HTTP {resp.status_code}')
-            return {'success': False, 'error': err}
+
+            err_obj = data.get('error', {}) if isinstance(data, dict) else {}
+            err_msg = err_obj.get('message') or err_obj.get('error_user_msg') or f'HTTP {resp.status_code}'
+            err_code = err_obj.get('code')
+
+            # خطأ FB #100 — غالباً الكوكيز/الصلاحيات ليست لهذه الصفحة
+            if err_code == 100 or 'does not resolve to a valid user' in str(err_msg).lower():
+                return {
+                    'success': False,
+                    'error': (
+                        'الكوكيز لا تمتلك صلاحية النشر على هذه الصفحة، '
+                        'أو الـ Page ID غير صحيح. تحقق من:\n'
+                        '• أن Page ID يخص صفحة تديرها بنفس الحساب\n'
+                        '• أن الكوكيز حديثة وغير منتهية\n'
+                        '• أن لديك صلاحية المشرف على الصفحة'
+                    ),
+                    'fb_code': err_code,
+                }
+            return {'success': False, 'error': err_msg, 'fb_code': err_code}
 
     async def create_ad_creative_post(
         self, ad_account_id: str, page_id: str,
@@ -362,7 +589,7 @@ class FacebookAPIClient:
 
     async def create_ad_creative_dark_post(
         self, ad_account_id: str, page_id: str,
-        photo_id: str, caption: str, objective: str
+        image_hash: str, caption: str, objective: str
     ) -> Dict[str, Any]:
         cta_type = AdObjectives.get_cta_type(objective)
         result = await self._request(
@@ -372,7 +599,7 @@ class FacebookAPIClient:
                 'object_story_spec': {
                     'page_id': page_id,
                     'photo_data': {
-                        'photo_id':        photo_id,
+                        'image_hash':     image_hash,
                         'message':         caption,
                         'call_to_action':  {'type': cta_type},
                     }
@@ -473,6 +700,13 @@ async def fetch_page_posts(cookies: str, page_id: str,
     return await client.get_page_posts(page_id, limit)
 
 
+async def resolve_post_link(cookies: str, link_or_id: str,
+                            proxy: Optional[str] = None) -> Dict[str, Any]:
+    """مساعد على مستوى الموديول لاستخراج (page_id, post_id) من رابط بوست."""
+    client = FacebookAPIClient(cookies, proxy)
+    return await client.resolve_post_link(link_or_id)
+
+
 async def _rollback(client: FacebookAPIClient, *,
                     campaign_id: Optional[str] = None,
                     ad_set_id:   Optional[str] = None,
@@ -495,24 +729,57 @@ async def _pause_all(client: FacebookAPIClient,
     await client.pause_campaign(campaign_id)
 
 
+def _is_inconclusive_error(err_text: str) -> bool:
+    """
+    أخطاء graph API بتظهر أحياناً لأسباب بنية (app context / access token)
+    مش بسبب صلاحيات حقيقية. الفحص الاستباقى ميقدرش يفصل بينها، فنعتبرها
+    inconclusive ونكمّل — العمليات الفعلية هتطلع الخطأ الحقيقى لو فيه.
+
+    الأكواد الشائعة:
+      #104 An access token is required to request this resource.
+      #200 Provide valid app ID.
+      #2500 An active access token must be used to query information.
+    """
+    if not err_text:
+        return False
+    t = str(err_text).lower()
+    inconclusive_codes = ('#104', '#200', '#2500')
+    if any(code in t for code in inconclusive_codes):
+        return True
+    keywords = (
+        'access token is required',
+        'an active access token',
+        'provide valid app id',
+    )
+    return any(k in t for k in keywords)
+
+
 async def _check_permissions(client: FacebookAPIClient,
                               ad_account_id: str,
                               page_id: str) -> Optional[Dict[str, Any]]:
     """
     فحص صلاحيات الحساب والصفحة قبل البدء.
-    يُرجع None لو كل شيء تمام، وdict خطأ لو في مشكلة.
+    يُرجع None لو كل شيء تمام (أو الفحص inconclusive)، وdict خطأ لو في مشكلة حقيقية.
     """
     acc_check = await client.check_ad_account(ad_account_id)
     if not acc_check['success']:
-        return {'success': False,
-                'step':  'فحص حساب الإعلانات',
-                'error': acc_check['error']}
+        if _is_inconclusive_error(acc_check.get('error', '')):
+            # الفحص الاستباقى مش قادر يحسم — نكمّل والعمليات الفعلية هتظهر
+            # الخطأ الحقيقى لو فيه مشكلة
+            pass
+        else:
+            return {'success': False,
+                    'step':  'فحص حساب الإعلانات',
+                    'error': acc_check['error']}
 
     page_check = await client.check_page_access(page_id)
     if not page_check['success']:
-        return {'success': False,
-                'step':  'فحص صلاحيات الصفحة',
-                'error': page_check['error']}
+        if _is_inconclusive_error(page_check.get('error', '')):
+            pass
+        else:
+            return {'success': False,
+                    'step':  'فحص صلاحيات الصفحة',
+                    'error': page_check['error']}
 
     return None   # لا توجد مشكلة
 
@@ -527,7 +794,7 @@ async def _run_ad_core(
     campaign_name: str,
     page_id:       str,
     objective:     str,
-    photo_id:      Optional[str] = None,
+    image_hash:    Optional[str] = None,
     partner_page_id: Optional[str] = None,
     partner_post_id: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -568,9 +835,9 @@ async def _run_ad_core(
 
     # ── 4. Creative ──
     step = "إنشاء Creative"
-    if photo_id:
+    if image_hash:
         creative = await client.create_ad_creative_dark_post(
-            data['ad_account_id'], page_id, photo_id, data.get('caption', ''), objective)
+            data['ad_account_id'], page_id, image_hash, data.get('caption', ''), objective)
     elif partner_page_id and partner_post_id:
         creative = await client.create_ad_creative_partner(
             data['ad_account_id'], page_id, partner_page_id, partner_post_id, objective)
@@ -650,19 +917,24 @@ async def run_dark_post_ad(data: dict) -> Dict[str, Any]:
     client        = FacebookAPIClient(data['cookies'], data.get('proxy'))
     page_id       = data['page_id']
     campaign_name = f"DarkPost - {page_id[:8]}"
-    photo_id      = None
+    image_hash    = None
+
+    # فحص استباقي: لازم يكون للمستخدم صلاحية إنشاء محتوى على الصفحة
+    role_check = await client.check_page_can_create_content(page_id)
+    if not role_check['success']:
+        return {'success': False, 'step': 'فحص دور الصفحة', 'error': role_check['error']}
 
     if data.get('image_path'):
         step  = "رفع الصورة"
-        photo = await client.upload_photo(page_id, data['image_path'], data.get('caption', ''))
-        if not photo['success']:
-            return {'success': False, 'step': step, 'error': photo['error']}
-        photo_id = photo['photo_id']
+        upload = await client.upload_ad_image(data['ad_account_id'], data['image_path'])
+        if not upload['success']:
+            return {'success': False, 'step': step, 'error': upload['error']}
+        image_hash = upload['image_hash']
 
     result = await _run_ad_core(client, data, campaign_name, page_id, data['objective'],
-                                photo_id=photo_id)
+                                image_hash=image_hash)
     if result['success']:
-        result['photo_id'] = photo_id
+        result['image_hash'] = image_hash
     return result
 
 
@@ -671,19 +943,24 @@ async def run_dark_post_ad_then_pause(data: dict) -> Dict[str, Any]:
     client        = FacebookAPIClient(data['cookies'], data.get('proxy'))
     page_id       = data['page_id']
     campaign_name = f"DarkPost - {page_id[:8]}"
-    photo_id      = None
+    image_hash    = None
+
+    # فحص استباقي: لازم يكون للمستخدم صلاحية إنشاء محتوى على الصفحة
+    role_check = await client.check_page_can_create_content(page_id)
+    if not role_check['success']:
+        return {'success': False, 'step': 'فحص دور الصفحة', 'error': role_check['error']}
 
     if data.get('image_path'):
         step  = "رفع الصورة"
-        photo = await client.upload_photo(page_id, data['image_path'], data.get('caption', ''))
-        if not photo['success']:
-            return {'success': False, 'step': step, 'error': photo['error']}
-        photo_id = photo['photo_id']
+        upload = await client.upload_ad_image(data['ad_account_id'], data['image_path'])
+        if not upload['success']:
+            return {'success': False, 'step': step, 'error': upload['error']}
+        image_hash = upload['image_hash']
 
     result = await _run_ad_core(client, data, campaign_name, page_id, data['objective'],
-                                photo_id=photo_id)
+                                image_hash=image_hash)
     if result['success']:
-        result['photo_id'] = photo_id
+        result['image_hash'] = image_hash
         await _pause_all(client, result['campaign_id'],
                          result['ad_set_id'], result['ad_id'])
         result['paused'] = True

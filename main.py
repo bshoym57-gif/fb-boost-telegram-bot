@@ -51,6 +51,23 @@ GATES = {
     'partner_ship': partner_ship_gate,
 }
 
+# قفل لكل مستخدم (Single-flight): يضمن عدم تشغيل أكتر من فلو إعلان فى نفس الوقت
+# المفتاح = user_id, القيمة = gate_id الحالى
+_active_jobs: dict[int, str] = {}
+
+
+def _job_active_for(user_id: int) -> bool:
+    return user_id in _active_jobs
+
+
+def _set_active_job(user_id: int, gate_id: str):
+    _active_jobs[user_id] = gate_id
+
+
+def _clear_active_job(user_id: int):
+    _active_jobs.pop(user_id, None)
+
+
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode='HTML'))
 dp  = Dispatcher(storage=MemoryStorage())
 
@@ -99,6 +116,7 @@ async def send_home(msg_or_call, user_id: int):
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
+    _clear_active_job(message.from_user.id)
     db.add_user(
         message.from_user.id,
         message.from_user.username or '',
@@ -110,6 +128,7 @@ async def start(message: Message, state: FSMContext):
 @dp.callback_query(F.data == 'home')
 async def home(call: CallbackQuery, state: FSMContext):
     await state.clear()
+    _clear_active_job(call.from_user.id)
     await send_home(call, call.from_user.id)
     await call.answer()
 
@@ -180,12 +199,27 @@ async def enter_gate(call: CallbackQuery, state: FSMContext):
     if not is_subscribed(row):
         await call.answer('❌ اشترك أولاً بكود Redeem.', show_alert=True)
         return
-    db.inc('requests')
+
+    user_id = call.from_user.id
     gate_id = call.data.split(':', 1)[1]
     gate    = GATES.get(gate_id)
     if not gate:
         await call.answer('البوابة غير موجودة.', show_alert=True)
         return
+
+    # منع تشغيل أكتر من فلو إعلان فى نفس الوقت لنفس المستخدم
+    if _job_active_for(user_id):
+        active_gate_id = _active_jobs.get(user_id)
+        active_name = GATE_NAMES.get(active_gate_id, active_gate_id)
+        await call.answer(
+            f"⛔ لديك إعلان قيد التنفيذ بالفعل: {active_name}\n"
+            "أنهِ الإعلان الحالى أو ارجع للقائمة الرئيسية أولاً.",
+            show_alert=True,
+        )
+        return
+
+    db.inc('requests')
+    _set_active_job(user_id, gate_id)
     await gate.enter(call, state, {'gate_names': GATE_NAMES})
     await call.answer()
 
@@ -250,6 +284,15 @@ async def _dispatch(state, attr, *args):
     gate = GATES.get(data.get('gate_type'))
     if gate and hasattr(gate, attr):
         await getattr(gate, attr)(*args, state)
+    # تحرير قفل المستخدم تلقائياً لما الـ FSM يكون اتمسح (تم إنهاء/إلغاء الفلو)
+    try:
+        if (await state.get_state()) is None:
+            event = args[0] if args else None
+            user_id = getattr(getattr(event, 'from_user', None), 'id', None)
+            if user_id is not None:
+                _clear_active_job(user_id)
+    except Exception:
+        pass
 
 
 @dp.message(AdGateStates.waiting_cookies)
