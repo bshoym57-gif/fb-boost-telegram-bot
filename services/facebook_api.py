@@ -721,15 +721,27 @@ async def _pause_all(client: FacebookAPIClient,
 
 def _is_inconclusive_error(err_text: str) -> bool:
     """
-    أخطاء graph API بتظهر أحياناً لأسباب بنية (app context) مش بسبب صلاحيات
-    حقيقية. الفحص الاستباقى ميقدرش يفصل بينها، فنعتبرها inconclusive
-    ونكمّل — العمليات الفعلية هتطلع الخطأ الحقيقى لو فيه.
+    أخطاء graph API بتظهر أحياناً لأسباب بنية (app context / access token)
+    مش بسبب صلاحيات حقيقية. الفحص الاستباقى ميقدرش يفصل بينها، فنعتبرها
+    inconclusive ونكمّل — العمليات الفعلية هتطلع الخطأ الحقيقى لو فيه.
+
+    الأكواد الشائعة:
+      #104 An access token is required to request this resource.
+      #200 Provide valid app ID.
+      #2500 An active access token must be used to query information.
     """
     if not err_text:
         return False
     t = str(err_text).lower()
-    # (#200) Provide valid app ID, (#2500) An active access token, ...
-    return '#200' in t or '#2500' in t or 'provide valid app id' in t
+    inconclusive_codes = ('#104', '#200', '#2500')
+    if any(code in t for code in inconclusive_codes):
+        return True
+    keywords = (
+        'access token is required',
+        'an active access token',
+        'provide valid app id',
+    )
+    return any(k in t for k in keywords)
 
 
 async def _check_permissions(client: FacebookAPIClient,
