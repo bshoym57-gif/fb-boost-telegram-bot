@@ -8,6 +8,7 @@ from keyboards import (
 from states import AdObjectives, GateConstants, AdGateStates
 from gates.base_gate import BaseGate
 from services.facebook_api import run_dark_post_ad, run_dark_post_ad_then_pause
+from services.proxy_manager import ProxyManager
 
 
 def _result_text(result: dict, gate_name: str) -> str:
@@ -50,7 +51,7 @@ class DarkPostGate(BaseGate):
         await state.update_data(proxy=proxy)
         await state.set_state(AdGateStates.waiting_cookies)
         await call.message.edit_text(
-            f"✅ <b>البروكسي:</b> {proxy}\n\n"
+            f"✅ <b>البروكسي:</b> {ProxyManager.mask(proxy)}\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "🔽 <b>الخطوة 2:</b> أرسل كوكيز فيسبوك",
             reply_markup=back_to_proxy()
@@ -72,10 +73,15 @@ class DarkPostGate(BaseGate):
             await message.answer(error, reply_markup=back_home())
             return
         proxy = message.text.strip() if message.text.strip().lower() != 'skip' else None
+        # مسح رسالة المستخدم التي تحتوي البروكسي صريحاً
+        try:
+            await message.delete()
+        except Exception:
+            pass
         await state.update_data(proxy=proxy)
         await state.set_state(AdGateStates.waiting_cookies)
         await message.answer(
-            f"✅ <b>البروكسي:</b> {proxy or 'بدون'}\n\n"
+            f"✅ <b>البروكسي:</b> {ProxyManager.mask(proxy)}\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "🔽 <b>الخطوة 2:</b> أرسل كوكيز فيسبوك",
             reply_markup=back_to_proxy()
@@ -280,4 +286,6 @@ class DarkPostGate(BaseGate):
         except Exception as e:
             self.cleanup_temp_files(data.get('image_path'))
             await call.message.edit_text(f"❌ <b>خطأ:</b>\n{e}", reply_markup=back_home())
+        # إنهاء الفلو لتحرير قفل المستخدم تلقائياً
+        await state.clear()
         await call.answer()

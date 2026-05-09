@@ -73,6 +73,13 @@ class ProxyManager:
     def _normalize(proxy: str) -> str:
         return proxy if '://' in proxy else f'http://{proxy}'
 
+    @staticmethod
+    def mask(proxy: Optional[str]) -> str:
+        """عرض البروكسي بشكل مقنّع للمستخدم (لا يكشف IP/Port/Credentials)."""
+        if not proxy:
+            return 'بدون'
+        return '✅ بروكسي مفعّل'
+
     async def health_check(self, proxy: str) -> bool:
         """
         فحص البروكسي عن طريق الاتصال بـ Facebook Graph API.

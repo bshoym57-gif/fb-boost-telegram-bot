@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 from aiogram.types import Message, CallbackQuery, PhotoSize
 from aiogram.fsm.context import FSMContext
 from states import AdObjectives, GateConstants, AdGateStates
+from services.proxy_manager import ProxyManager
 
 TEMP_DIR = Path('data/temp')
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -156,7 +157,8 @@ class BaseGate(ABC):
         file_name = f"{self.gate_id}_{message.from_user.id}_{message.message_id}.jpg"
         file_path = TEMP_DIR / file_name
         try:
-            await message.bot.download(destination=file_path, file_id=photo.file_id)
+            # aiogram v3: download() expects the file/file_id as first positional arg
+            await message.bot.download(photo.file_id, destination=file_path)
         except Exception as e:
             return False, f"❌ فشل تحميل الصورة: {str(e)}", None
         is_valid, error = self.validate_image_size(str(file_path))
@@ -179,7 +181,7 @@ class BaseGate(ABC):
             "━━━━━━━━━━━━━━━━━━━━",
             f"🎯 <b>البوابة:</b> {self.gate_name}",
             "",
-            f"🌐 <b>البروكسي:</b> {data.get('proxy') or 'بدون'}",
+            f"🌐 <b>البروكسي:</b> {ProxyManager.mask(data.get('proxy'))}",
             f"🍪 <b>الكوكيز:</b> {'✅ موجود' if data.get('cookies') else '❌ غير موجود'}",
             f"🔢 <b>Account ID:</b> {data.get('ad_account_id', 'غير محدد')}",
         ]

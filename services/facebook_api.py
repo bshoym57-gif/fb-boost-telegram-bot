@@ -321,6 +321,11 @@ class FacebookAPIClient:
 
     async def upload_photo(self, page_id: str, image_path: str,
                            caption: str) -> Dict[str, Any]:
+        # تحقق من صلاحية Page ID قبل إرسال الطلب
+        if not page_id or not str(page_id).strip().isdigit() or int(page_id) <= 0:
+            return {'success': False,
+                    'error': 'Page ID غير صالح — تحقق من معرف الصفحة وأعد المحاولة'}
+
         with open(image_path, 'rb') as f:
             image_data = f.read()
         async with httpx.AsyncClient(
@@ -340,8 +345,25 @@ class FacebookAPIClient:
                         'error': f'رد غير JSON عند رفع الصورة (HTTP {resp.status_code})'}
             if resp.status_code == 200 and 'id' in data:
                 return {'success': True, 'photo_id': data['id'], 'data': data}
-            err = data.get('error', {}).get('message', f'HTTP {resp.status_code}')
-            return {'success': False, 'error': err}
+
+            err_obj = data.get('error', {}) if isinstance(data, dict) else {}
+            err_msg = err_obj.get('message') or err_obj.get('error_user_msg') or f'HTTP {resp.status_code}'
+            err_code = err_obj.get('code')
+
+            # خطأ FB #100 — غالباً الكوكيز/الصلاحيات ليست لهذه الصفحة
+            if err_code == 100 or 'does not resolve to a valid user' in str(err_msg).lower():
+                return {
+                    'success': False,
+                    'error': (
+                        'الكوكيز لا تمتلك صلاحية النشر على هذه الصفحة، '
+                        'أو الـ Page ID غير صحيح. تحقق من:\n'
+                        '• أن Page ID يخص صفحة تديرها بنفس الحساب\n'
+                        '• أن الكوكيز حديثة وغير منتهية\n'
+                        '• أن لديك صلاحية المشرف على الصفحة'
+                    ),
+                    'fb_code': err_code,
+                }
+            return {'success': False, 'error': err_msg, 'fb_code': err_code}
 
     async def create_ad_creative_post(
         self, ad_account_id: str, page_id: str,
