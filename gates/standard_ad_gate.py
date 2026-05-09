@@ -8,7 +8,8 @@ from keyboards import (
 from states import AdObjectives, GateConstants, AdGateStates
 from gates.base_gate import BaseGate
 from services.facebook_api import (
-    run_standard_ad, run_standard_ad_then_pause, fetch_page_posts
+    run_standard_ad, run_standard_ad_then_pause, fetch_page_posts,
+    resolve_post_link
 )
 from services.proxy_manager import ProxyManager
 
@@ -41,8 +42,8 @@ class StandardAdGate(BaseGate):
             "━━━━━━━━━━━━━━━━━━━━\n"
             "📋 <b>خطوات العمل:</b>\n"
             "1️⃣ البروكسي\n2️⃣ الكوكيز\n3️⃣ Account ID\n"
-            "4️⃣ Page ID\n5️⃣ اختيار البوست\n"
-            "6️⃣ الهدف + الأوديانس\n7️⃣ الميزانية والأيام\n8️⃣ مراجعة وتشغيل\n\n"
+            "4️⃣ رابط البوست (بيستخرج منه Page ID + Post ID تلقائياً)\n"
+            "5️⃣ الهدف + الأوديانس\n6️⃣ الميزانية والأيام\n7️⃣ مراجعة وتشغيل\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "🔽 <b>الخطوة 1:</b> اختر البروكسي",
             reply_markup=proxy_selection_keyboard()
@@ -126,12 +127,19 @@ class StandardAdGate(BaseGate):
             await message.answer(result, reply_markup=back_home())
             return
         await state.update_data(ad_account_id=result)
-        await state.set_state(AdGateStates.waiting_page_id)
+        # نتخطى خطوة Page ID ونسأل عن رابط البوست مباشرة —
+        # دالة resolve_post_link تستخرج page_id و post_id أوتوماتيكياً
+        await state.set_state(AdGateStates.waiting_post_link)
         await message.answer(
             f"✅ <b>Account ID:</b> {result}\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "🔽 <b>الخطوة 4:</b> أدخل Page ID\n"
-            "(معرف صفحتك على فيسبوك - أرقام فقط)",
+            "🔽 <b>الخطوة 4:</b> أرسل رابط البوست اللي عايز تبوسته\n\n"
+            "📌 البوت بيستخرج Page ID و Post ID أوتوماتيكياً من الرابط.\n"
+            "📌 أمثلة مقبولة:\n"
+            "• https://www.facebook.com/PageName/posts/pfbid0...\n"
+            "• https://www.facebook.com/permalink.php?story_fbid=...&id=...\n"
+            "• https://www.facebook.com/123456789/posts/987654321\n"
+            "• أو Post ID خام (رقم فقط)",
             reply_markup=back_home()
         )
 
@@ -226,14 +234,36 @@ class StandardAdGate(BaseGate):
         if not is_valid:
             await message.answer(error, reply_markup=back_home())
             return
-        post_id = self.extract_post_id(text)
-        link = text if 'facebook.com' in text else f"https://facebook.com/posts/{post_id}"
-        await state.update_data(post_link=link, post_id=post_id)
+
+        # نستخرج page_id + post_id إما من URL أو عبر Graph API
+        loading = await message.answer("⏳ جاري استخراج Page ID و Post ID من الرابط...")
+        data = await state.get_data()
+        resolved = await resolve_post_link(
+            cookies=data['cookies'], link_or_id=text, proxy=data.get('proxy')
+        )
+        if not resolved.get('success'):
+            await loading.edit_text(
+                f"❌ <b>تعذّر استخراج بيانات البوست</b>\n\n"
+                f"🔴 {resolved.get('error', 'خطأ غير معروف')}\n\n"
+                "تأكد أن:\n"
+                "• الرابط لمنشور صفحة عامة\n"
+                "• الكوكيز تملك صلاحية رؤية البوست\n"
+                "• الرابط سليم وغير مختصر",
+                reply_markup=back_home()
+            )
+            return
+
+        page_id = resolved['page_id']
+        post_id = resolved['post_id']
+        link    = text if 'facebook.com' in text or 'fb.watch' in text else f"https://facebook.com/{post_id}"
+        await state.update_data(page_id=page_id, post_id=post_id, post_link=link)
         await state.set_state(AdGateStates.waiting_objective)
-        await message.answer(
-            f"✅ <b>Post ID:</b> <code>{post_id}</code>\n\n"
+        await loading.edit_text(
+            f"✅ <b>تم استخراج بيانات البوست</b>\n\n"
+            f"📄 <b>Page ID:</b> <code>{page_id}</code>\n"
+            f"📌 <b>Post ID:</b> <code>{post_id}</code>\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "🔽 <b>الخطوة 6:</b> اختر هدف الإعلان",
+            "🔽 <b>الخطوة 5:</b> اختر هدف الإعلان",
             reply_markup=objective_selection_keyboard()
         )
 
@@ -246,7 +276,7 @@ class StandardAdGate(BaseGate):
         await call.message.edit_text(
             f"✅ <b>الهدف:</b> {AdObjectives.get_display_name(objective)}\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "🔽 <b>الخطوة 7:</b> أدخل Audience ID\n"
+            "🔽 <b>الخطوة 6:</b> أدخل Audience ID\n"
             "(اختياري — اكتب skip للتخطي)",
             reply_markup=back_home()
         )
@@ -264,7 +294,7 @@ class StandardAdGate(BaseGate):
         await message.answer(
             f"✅ <b>Audience ID:</b> {result or 'افتراضي'}\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔽 <b>الخطوة 8:</b> أدخل الميزانية اليومية (USD)\n"
+            f"🔽 <b>الخطوة 7:</b> أدخل الميزانية اليومية (USD)\n"
             f"(الافتراضي: {GateConstants.DEFAULT_BUDGET}$ — اكتب skip للتخطي)",
             reply_markup=back_home()
         )
@@ -281,7 +311,7 @@ class StandardAdGate(BaseGate):
         await message.answer(
             f"✅ <b>الميزانية:</b> {result}$\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔽 <b>الخطوة 9:</b> أدخل عدد الأيام\n"
+            f"🔽 <b>الخطوة 8:</b> أدخل عدد الأيام\n"
             f"(الافتراضي: {GateConstants.DEFAULT_DAYS} — اكتب skip للتخطي)",
             reply_markup=back_home()
         )

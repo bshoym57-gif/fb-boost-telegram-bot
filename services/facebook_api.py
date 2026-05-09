@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import re
 import time
 from typing import Optional, Dict, Any
 
@@ -235,6 +236,85 @@ class FacebookAPIClient:
             'data':             r['data'],
             'whatsapp_number':  r['data'].get('whatsapp_number', ''),
         }
+
+    async def resolve_post_link(self, link_or_id: str) -> Dict[str, Any]:
+        """
+        من رابط/معرف بوست فيسبوك، يستخرج (page_id, post_id).
+        يجرّب أنماط الـ URL أولاً، وعند الحاجة يهبط على Graph API.
+        """
+        text = (link_or_id or '').strip()
+        if not text:
+            return {'success': False, 'error': 'الرابط أو معرف البوست فارغ'}
+
+        # 1) صيغة "pageId_postId" — جاهز
+        m = re.match(r'^(\d+)_(\d+)$', text)
+        if m:
+            return {'success': True, 'page_id': m.group(1), 'post_id': text}
+
+        # 2) رقم خام — نستخدم Graph API لمعرفة الصفحة
+        if re.match(r'^\d{6,30}$', text):
+            return await self._resolve_via_api(text)
+
+        # 3) محاولة استخراج page_id من URL
+        page_id_from_url: Optional[str] = None
+        post_id_from_url: Optional[str] = None
+
+        m = re.search(r'(?:^|[?&])id=(\d+)', text)
+        if m:
+            page_id_from_url = m.group(1)
+        else:
+            m = re.search(r'facebook\.com/(\d{10,20})/(?:posts|videos|photos|reels)', text)
+            if m:
+                page_id_from_url = m.group(1)
+
+        url_patterns = [
+            r'/posts/(\d+)',
+            r'/posts/(pfbid\w+)',
+            r'story_fbid=(\d+|pfbid\w+)',
+            r'/videos/(\d+)',
+            r'/reel/(\d+)',
+            r'fbid=(\d+)',
+            r'/permalink/(\d+)',
+            r'/(\d{10,30})/?(?:\?|$)',
+        ]
+        for p in url_patterns:
+            m = re.search(p, text)
+            if m:
+                post_id_from_url = m.group(1)
+                break
+
+        # لو الاتنين موجودين رقمياً → نبني pageId_postId ونرجعه
+        if page_id_from_url and post_id_from_url and post_id_from_url.isdigit():
+            return {
+                'success': True,
+                'page_id': page_id_from_url,
+                'post_id': f'{page_id_from_url}_{post_id_from_url}',
+            }
+
+        # 4) فقط post_id موجود — نسأل Graph API عن الصفحة
+        if post_id_from_url:
+            return await self._resolve_via_api(post_id_from_url)
+
+        return {'success': False, 'error': 'تعذّر استخراج معرف البوست من الرابط'}
+
+    async def _resolve_via_api(self, post_id: str) -> Dict[str, Any]:
+        """يسأل Graph API عن البوست لاستخراج page_id و post_id الكامل."""
+        r = await self._request('GET', post_id, params={'fields': 'id,from'})
+        if not r['success']:
+            return {
+                'success': False,
+                'error': f'فشل التحقق من البوست عبر Facebook: {r.get("error")}',
+            }
+        data = r.get('data', {}) or {}
+        from_obj = data.get('from') or {}
+        page_id = from_obj.get('id')
+        full_post_id = data.get('id') or post_id
+        if not page_id:
+            return {
+                'success': False,
+                'error': 'لم يُعثر على معرف الصفحة (from) فى رد Facebook — تأكد أن الرابط لمنشور صفحة.',
+            }
+        return {'success': True, 'page_id': page_id, 'post_id': full_post_id}
 
     async def check_page_can_create_content(self, page_id: str) -> Dict[str, Any]:
         """
@@ -595,6 +675,13 @@ async def fetch_page_posts(cookies: str, page_id: str,
                            limit: int = 10) -> Dict[str, Any]:
     client = FacebookAPIClient(cookies, proxy)
     return await client.get_page_posts(page_id, limit)
+
+
+async def resolve_post_link(cookies: str, link_or_id: str,
+                            proxy: Optional[str] = None) -> Dict[str, Any]:
+    """مساعد على مستوى الموديول لاستخراج (page_id, post_id) من رابط بوست."""
+    client = FacebookAPIClient(cookies, proxy)
+    return await client.resolve_post_link(link_or_id)
 
 
 async def _rollback(client: FacebookAPIClient, *,
