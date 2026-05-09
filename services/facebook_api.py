@@ -167,24 +167,34 @@ class FacebookAPIClient:
 
                 # ── معالجة ردود non-JSON ──
                 content_type = resp.headers.get('content-type', '')
+                raw_text = resp.text or ''
                 if 'application/json' not in content_type and 'text/javascript' not in content_type:
                     # Facebook أحياناً يرجع HTML لو الجلسة منتهية
                     if resp.status_code in (401, 403):
                         return {'success': False,
                                 'error': 'انتهت صلاحية الكوكيز أو غير مصرح (401/403)',
-                                'raw': resp.text[:200]}
-                    if 'login' in resp.text.lower() or 'checkpoint' in resp.text.lower():
+                                'raw': raw_text[:200]}
+                    if 'login' in raw_text.lower() or 'checkpoint' in raw_text.lower():
                         return {'success': False,
                                 'error': 'فيسبوك طلب تسجيل دخول — تحقق من الكوكيز',
-                                'raw': resp.text[:200]}
+                                'raw': raw_text[:200]}
 
                 try:
                     data = resp.json()
                 except Exception:
+                    snippet = (raw_text[:300] or '(فارغ)').strip()
+                    # نطبع الـ raw response فى لوج البوت لتسهيل التشخيص
+                    print(f'[FB non-JSON] {method} {endpoint} -> HTTP {resp.status_code}')
+                    print(f'[FB non-JSON] content-type: {content_type}')
+                    print(f'[FB non-JSON] body[:500]: {raw_text[:500]}')
                     return {
                         'success': False,
-                        'error':   f'رد غير JSON من Facebook (HTTP {resp.status_code})',
-                        'raw':     resp.text[:300],
+                        'error':   (
+                            f'رد غير JSON من Facebook (HTTP {resp.status_code}).\n'
+                            f'Content-Type: {content_type or "?"}\n'
+                            f'مقتطف: {snippet[:220]}'
+                        ),
+                        'raw':     raw_text[:1000],
                     }
 
                 if resp.status_code != 200 or 'error' in data:
