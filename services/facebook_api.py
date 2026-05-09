@@ -240,22 +240,25 @@ class FacebookAPIClient:
     async def resolve_post_link(self, link_or_id: str) -> Dict[str, Any]:
         """
         من رابط/معرف بوست فيسبوك، يستخرج (page_id, post_id).
-        يجرّب أنماط الـ URL أولاً، وعند الحاجة يهبط على Graph API.
+        post_id المُرجَع "خام" (بدون بادئة page_id_) لأن
+        create_ad_creative_post بيبنى object_story_id بالشكل page_id_post_id.
+
+        الترتيب:
+        1) صيغة pageId_postId مباشرة من المستخدم.
+        2) URL فيه page_id + post_id (الأكثر موثوقية، بدون أى API).
+        3) URL فيه post_id فقط، أو رقم خام → fallback على Graph API
+           (قد يفشل لو البوست status أو pfbid).
         """
         text = (link_or_id or '').strip()
         if not text:
             return {'success': False, 'error': 'الرابط أو معرف البوست فارغ'}
 
-        # 1) صيغة "pageId_postId" — جاهز
-        m = re.match(r'^(\d+)_(\d+)$', text)
+        # 1) صيغة "pageId_postId" — رجّع post_id خام
+        m = re.match(r'^(\d+)_(\w+)$', text)
         if m:
-            return {'success': True, 'page_id': m.group(1), 'post_id': text}
+            return {'success': True, 'page_id': m.group(1), 'post_id': m.group(2)}
 
-        # 2) رقم خام — نستخدم Graph API لمعرفة الصفحة
-        if re.match(r'^\d{6,30}$', text):
-            return await self._resolve_via_api(text)
-
-        # 3) محاولة استخراج page_id من URL
+        # 2) محاولة استخراج page_id و post_id من URL
         page_id_from_url: Optional[str] = None
         post_id_from_url: Optional[str] = None
 
@@ -268,9 +271,9 @@ class FacebookAPIClient:
                 page_id_from_url = m.group(1)
 
         url_patterns = [
-            r'/posts/(\d+)',
             r'/posts/(pfbid\w+)',
-            r'story_fbid=(\d+|pfbid\w+)',
+            r'/posts/(\d+)',
+            r'story_fbid=(pfbid\w+|\d+)',
             r'/videos/(\d+)',
             r'/reel/(\d+)',
             r'fbid=(\d+)',
@@ -283,22 +286,28 @@ class FacebookAPIClient:
                 post_id_from_url = m.group(1)
                 break
 
-        # لو الاتنين موجودين رقمياً → نبني pageId_postId ونرجعه
-        if page_id_from_url and post_id_from_url and post_id_from_url.isdigit():
+        # 2-أ) الاتنين موجودين فى URL → نثق بيهم بدون استعلام (الأفضل)
+        # FB ad creative بيقبل page_id_pfbid... وبيقبل page_id_<numeric>
+        if page_id_from_url and post_id_from_url:
             return {
                 'success': True,
                 'page_id': page_id_from_url,
-                'post_id': f'{page_id_from_url}_{post_id_from_url}',
+                'post_id': post_id_from_url,
             }
 
-        # 4) فقط post_id موجود — نسأل Graph API عن الصفحة
+        # 3) رقم خام أو URL ناقص → استعلام Graph API
+        if re.match(r'^\d{6,30}$', text):
+            return await self._resolve_via_api(text)
         if post_id_from_url:
             return await self._resolve_via_api(post_id_from_url)
 
         return {'success': False, 'error': 'تعذّر استخراج معرف البوست من الرابط'}
 
     async def _resolve_via_api(self, post_id: str) -> Dict[str, Any]:
-        """يسأل Graph API عن البوست لاستخراج page_id و post_id الكامل."""
+        """
+        يسأل Graph API عن البوست لاستخراج page_id والـ post_id الخام.
+        قد يفشل بـ #12 لو البوست status — فى الحالة دى لازم URL يحتوى page_id.
+        """
         r = await self._request('GET', post_id, params={'fields': 'id,from'})
         if not r['success']:
             return {
@@ -314,7 +323,11 @@ class FacebookAPIClient:
                 'success': False,
                 'error': 'لم يُعثر على معرف الصفحة (from) فى رد Facebook — تأكد أن الرابط لمنشور صفحة.',
             }
-        return {'success': True, 'page_id': page_id, 'post_id': full_post_id}
+        # full_post_id = "pageId_postId" → نستخرج post_id الخام
+        bare_post_id = full_post_id
+        if full_post_id.startswith(f'{page_id}_'):
+            bare_post_id = full_post_id.split('_', 1)[1]
+        return {'success': True, 'page_id': page_id, 'post_id': bare_post_id}
 
     async def check_page_can_create_content(self, page_id: str) -> Dict[str, Any]:
         """
