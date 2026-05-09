@@ -719,24 +719,45 @@ async def _pause_all(client: FacebookAPIClient,
     await client.pause_campaign(campaign_id)
 
 
+def _is_inconclusive_error(err_text: str) -> bool:
+    """
+    أخطاء graph API بتظهر أحياناً لأسباب بنية (app context) مش بسبب صلاحيات
+    حقيقية. الفحص الاستباقى ميقدرش يفصل بينها، فنعتبرها inconclusive
+    ونكمّل — العمليات الفعلية هتطلع الخطأ الحقيقى لو فيه.
+    """
+    if not err_text:
+        return False
+    t = str(err_text).lower()
+    # (#200) Provide valid app ID, (#2500) An active access token, ...
+    return '#200' in t or '#2500' in t or 'provide valid app id' in t
+
+
 async def _check_permissions(client: FacebookAPIClient,
                               ad_account_id: str,
                               page_id: str) -> Optional[Dict[str, Any]]:
     """
     فحص صلاحيات الحساب والصفحة قبل البدء.
-    يُرجع None لو كل شيء تمام، وdict خطأ لو في مشكلة.
+    يُرجع None لو كل شيء تمام (أو الفحص inconclusive)، وdict خطأ لو في مشكلة حقيقية.
     """
     acc_check = await client.check_ad_account(ad_account_id)
     if not acc_check['success']:
-        return {'success': False,
-                'step':  'فحص حساب الإعلانات',
-                'error': acc_check['error']}
+        if _is_inconclusive_error(acc_check.get('error', '')):
+            # الفحص الاستباقى مش قادر يحسم — نكمّل والعمليات الفعلية هتظهر
+            # الخطأ الحقيقى لو فيه مشكلة
+            pass
+        else:
+            return {'success': False,
+                    'step':  'فحص حساب الإعلانات',
+                    'error': acc_check['error']}
 
     page_check = await client.check_page_access(page_id)
     if not page_check['success']:
-        return {'success': False,
-                'step':  'فحص صلاحيات الصفحة',
-                'error': page_check['error']}
+        if _is_inconclusive_error(page_check.get('error', '')):
+            pass
+        else:
+            return {'success': False,
+                    'step':  'فحص صلاحيات الصفحة',
+                    'error': page_check['error']}
 
     return None   # لا توجد مشكلة
 
