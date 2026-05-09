@@ -236,6 +236,39 @@ class FacebookAPIClient:
             'whatsapp_number':  r['data'].get('whatsapp_number', ''),
         }
 
+    async def check_page_can_create_content(self, page_id: str) -> Dict[str, Any]:
+        """
+        تحقق من إن المستخدم عنده صلاحية إنشاء منشورات جديدة على الصفحة
+        (Content Creator أو أعلى). ضروري لإعلانات الدارك بوست.
+        المعلن فقط (ADVERTISE) مش كفاية.
+        """
+        r = await self._request(
+            'GET', page_id,
+            params={'fields': 'name,tasks'}
+        )
+        if not r['success']:
+            return r
+        tasks = r['data'].get('tasks', []) or []
+        # الصلاحيات اللى تسمح بإنشاء محتوى جديد
+        ALLOWED = {'CREATE_CONTENT', 'MANAGE', 'MODERATE', 'EDIT_PROFILE'}
+        if not any(t in ALLOWED for t in tasks):
+            tasks_label = '، '.join(tasks) if tasks else 'لا توجد'
+            return {
+                'success': False,
+                'error': (
+                    'دورك على هذه الصفحة لا يسمح بإنشاء منشورات جديدة (الدارك بوست).\n\n'
+                    f'الصلاحيات الحالية: {tasks_label}\n\n'
+                    'الدارك بوست يتطلّب دور <b>Content Creator</b> أو أعلى — '
+                    'دور "معلن فقط" غير كافٍ.\n\n'
+                    '<b>حلول مقترحة:</b>\n'
+                    '• استخدم بوابة "إعلان رابط بوست" بدلاً من الدارك بوست — '
+                    'لتعزيز منشور موجود مسبقاً على الصفحة (يعمل بصلاحية المعلن).\n'
+                    '• اطلب من مدير الصفحة رفع صلاحيتك إلى Content Creator.'
+                ),
+                'tasks': tasks,
+            }
+        return {'success': True, 'tasks': tasks}
+
     # ─────────────── حملة ───────────────
 
     async def create_campaign(self, ad_account_id: str, name: str,
@@ -334,20 +367,34 @@ class FacebookAPIClient:
         with open(image_path, 'rb') as f:
             image_data = f.read()
         file_name = os.path.basename(image_path) or 'image.jpg'
+
+        # Headers لرفع الصور: نتجنب Accept-Encoding: br لتفادى أخطاء فك الضغط،
+        # ونزيل Content-Type لو موجود (httpx بيحدده تلقائياً للـ multipart).
+        headers = self._get_headers()
+        headers['Accept-Encoding'] = 'gzip, deflate'
+        headers.pop('Content-Type', None)
+
         async with httpx.AsyncClient(
             timeout=120, proxies=self.proxies, follow_redirects=True
         ) as client:
             resp = await client.post(
                 f'{self.base_url}/act_{ad_account_id}/adimages',
-                headers=self._get_headers(),
+                headers=headers,
                 cookies=self.cookies_dict,
-                files={file_name: (file_name, image_data, 'image/jpeg')},
+                files={'source': (file_name, image_data, 'image/jpeg')},
             )
+            raw_text = resp.text
             try:
                 data = resp.json()
             except Exception:
+                # نطبع الـ raw response فى لوج البوت لتسهيل التشخيص
+                snippet = raw_text[:300] if raw_text else '(فارغ)'
+                print(f'[upload_ad_image] non-JSON HTTP {resp.status_code}: {snippet}')
                 return {'success': False,
-                        'error': f'رد غير JSON عند رفع الصورة (HTTP {resp.status_code})'}
+                        'error': (
+                            f'رد غير JSON من Facebook عند رفع الصورة (HTTP {resp.status_code}).\n'
+                            f'مقتطف: {snippet[:200]}'
+                        )}
 
             if resp.status_code == 200 and isinstance(data.get('images'), dict) and data['images']:
                 first_key = next(iter(data['images']))
@@ -371,7 +418,8 @@ class FacebookAPIClient:
                     ),
                     'fb_code': err_code,
                 }
-            return {'success': False, 'error': err_msg, 'fb_code': err_code}
+            return {'success': False, 'error': f'[{err_code}] {err_msg}' if err_code else err_msg,
+                    'fb_code': err_code}
 
     async def upload_photo(self, page_id: str, image_path: str,
                            caption: str) -> Dict[str, Any]:
@@ -728,6 +776,11 @@ async def run_dark_post_ad(data: dict) -> Dict[str, Any]:
     campaign_name = f"DarkPost - {page_id[:8]}"
     image_hash    = None
 
+    # فحص استباقي: لازم يكون للمستخدم صلاحية إنشاء محتوى على الصفحة
+    role_check = await client.check_page_can_create_content(page_id)
+    if not role_check['success']:
+        return {'success': False, 'step': 'فحص دور الصفحة', 'error': role_check['error']}
+
     if data.get('image_path'):
         step  = "رفع الصورة"
         upload = await client.upload_ad_image(data['ad_account_id'], data['image_path'])
@@ -748,6 +801,11 @@ async def run_dark_post_ad_then_pause(data: dict) -> Dict[str, Any]:
     page_id       = data['page_id']
     campaign_name = f"DarkPost - {page_id[:8]}"
     image_hash    = None
+
+    # فحص استباقي: لازم يكون للمستخدم صلاحية إنشاء محتوى على الصفحة
+    role_check = await client.check_page_can_create_content(page_id)
+    if not role_check['success']:
+        return {'success': False, 'step': 'فحص دور الصفحة', 'error': role_check['error']}
 
     if data.get('image_path'):
         step  = "رفع الصورة"
