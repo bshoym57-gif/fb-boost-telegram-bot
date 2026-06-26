@@ -24,7 +24,7 @@ from keyboards import (
     bm_card_select_keyboard, bm_proxy_keyboard,
 )
 from states import UserFlow, AdminFlow, AdGateStates, BMToolStates
-from services.bm_card_service import get_bm_cards, warm_bm_cards
+from services.bm_card_service import get_bm_cards, warm_bm_cards, _parse_cookies, _validate_cookie_keys
 from services.redeem import generate_code
 from services.proxy_manager import ProxyManager
 from gates.standard_ad_gate import StandardAdGate
@@ -491,8 +491,13 @@ async def bm_proxy_auto(call: CallbackQuery, state: FSMContext):
         "✅ <b>البروكسي:</b> تم اختيار بروكسي من البوت تلقائياً\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🔽 <b>الخطوة 2:</b> أرسل كوكيز Business Manager\n\n"
-        "📌 افتح <b>business.facebook.com</b> أو <b>instagram.com</b> في المتصفح\n"
-        "وانسخ الكوكيز من Developer Tools → Network → Cookie",
+        "📌 <b>أنواع الكوكيز المقبولة:</b>\n"
+        "• نسخ/لصق من المتصفح (Ctrl+C / Ctrl+V)\n"
+        "• تنسيق Cookie: name=value; ...\n"
+        "• تنسيق JSON: {\"name\": \"value\", ...}\n"
+        "• سطور منفصلة أو semicolon\n\n"
+        "💡 <b>مثال:</b>\n"
+        "<code>c_user=123;xs=abc;datr=xyz</code>",
         reply_markup=back_home()
     )
     await call.answer()
@@ -507,7 +512,14 @@ async def bm_proxy_skip(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text(
         "✅ <b>تم تخطي البروكسي</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🔽 <b>الخطوة 2:</b> أرسل كوكيز Business Manager",
+        "🔽 <b>الخطوة 2:</b> أرسل كوكيز Business Manager\n\n"
+        "📌 <b>أنواع الكوكيز المقبولة:</b>\n"
+        "• نسخ/لصق من المتصفح (Ctrl+C / Ctrl+V)\n"
+        "• تنسيق Cookie: name=value; ...\n"
+        "• تنسيق JSON: {\"name\": \"value\", ...}\n"
+        "• سطور منفصلة أو semicolon\n\n"
+        "💡 <b>مثال:</b>\n"
+        "<code>c_user=123;xs=abc;datr=xyz</code>",
         reply_markup=back_home()
     )
     await call.answer()
@@ -556,18 +568,55 @@ async def bm_proxy_custom_input(message: Message, state: FSMContext):
     await message.answer(
         "✅ <b>البروكسي:</b> تم حفظ البروكسي\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🔽 <b>الخطوة 2:</b> أرسل كوكيز Business Manager",
+        "🔽 <b>الخطوة 2:</b> أرسل كوكيز Business Manager\n\n"
+        "📌 <b>أنواع الكوكيز المقبولة:</b>\n"
+        "• نسخ/لصق من المتصفح (Ctrl+C / Ctrl+V)\n"
+        "• تنسيق Cookie: name=value; ...\n"
+        "• تنسيق JSON: {\"name\": \"value\", ...}\n"
+        "• سطور منفصلة أو semicolon\n\n"
+        "💡 <b>مثال:</b>\n"
+        "<code>c_user=123;xs=abc;datr=xyz</code>",
         reply_markup=back_home()
     )
 
 
 @dp.message(BMToolStates.waiting_cookies)
 async def bm_cookies_input(message: Message, state: FSMContext):
-    cookies = message.text.strip()
-    if len(cookies) < 20 or '=' not in cookies:
+    cookies_raw = message.text.strip()
+
+    # تحليل الكوكيز باستخدام الدالة المحسنة
+    parsed = _parse_cookies(cookies_raw)
+
+    # التحقق الأساسي
+    if not parsed or len(parsed) < 2:
         await message.answer(
-            "❌ <b>الكوكيز غير صالحة</b>\n\n"
-            "تأكد من نسخها بالكامل من المتصفح.",
+            "❌ <b>الكوكيز غير صالحة أو ناقصة</b>\n\n"
+            "📌 <b>التنسيقات المقبولة:</b>\n"
+            "• <code>name=value;name2=value2</code>\n"
+            "• <code>{\"name\": \"value\", \"name2\": \"value2\"}</code>\n"
+            "• نسخ مباشرة من DevTools\n\n"
+            "💡 <b>تأكد من تضمين كوكيز c_user و xs على الأقل</b>",
+            reply_markup=back_home()
+        )
+        return
+
+    # التحقق من المفاتيح الأساسية
+    validation = _validate_cookie_keys(parsed)
+    if not validation['looks_valid']:
+        missing = []
+        if not validation['has_c_user']:
+            missing.append('c_user')
+        if not validation['has_xs']:
+            missing.append('xs')
+        await message.answer(
+            f"⚠️ <b>كوكيز ناقصة - مفاتيح مفقودة: {', '.join(missing)}</b>\n\n"
+            f"📊 <b>إحصائيات الكوكيز:</b>\n"
+            f"• إجمالي المفاتيح: {validation['total_keys']}\n"
+            f"• c_user: {'✅' if validation['has_c_user'] else '❌'}\n"
+            f"• xs: {'✅' if validation['has_xs'] else '❌'}\n"
+            f"• datr: {'✅' if validation['has_datr'] else '❌'}\n"
+            f"• sb: {'✅' if validation['has_sb'] else '❌'}\n\n"
+            "💡 حاول نسخ الكوكيز كاملة من المتصفح مرة أخرى",
             reply_markup=back_home()
         )
         return
@@ -575,24 +624,47 @@ async def bm_cookies_input(message: Message, state: FSMContext):
     data = await state.get_data()
     proxy = data.get('bm_proxy')
 
+    # نرسل رسالة للمستخدم إننا بنحلل الكوكيز
+    analyzing_msg = await message.answer(
+        f"⏳ <b>جارٍ تحليل الكوكيز...</b>\n"
+        f"• المفاتيح الم encontrا: <b>{validation['total_keys']}</b>\n"
+        f"• c_user: ✅\n"
+        f"• xs: ✅\n\n"
+        f"جارٍ التحقق من صلاحية الجلسة..."
+    )
+
     from services.bm_card_service import verify_bm_cookies
-    validation = await verify_bm_cookies(cookies, proxy=proxy)
-    if not validation['success']:
+    validation_result = await verify_bm_cookies(cookies_raw, proxy=proxy)
+    await analyzing_msg.delete()
+
+    if not validation_result['success']:
+        # تحليل نوع الخطأ لإعطاء اقتراحات محددة
+        error_msg = validation_result['error']
+        suggestions = ""
+
+        if 'ناقصة' in error_msg or 'مفقودة' in error_msg.lower():
+            suggestions = "\n\n💡 <b>الحل:</b>\n- تأكد من نسخ الكوكيز كاملة\n- c_user و xs مطلوبين"
+        elif 'منتهية' in error_msg or 'login' in error_msg.lower() or 'checkpoint' in error_msg.lower():
+            suggestions = "\n\n💡 <b>الحل:</b>\n- الكوكيز منتهية، سجل دخول مرة أخرى\n- افتح business.facebook.com في المتصفح\n- أعد نسخ الكوكيز من صفحة جديدة"
+        elif 'Business Manager' in error_msg:
+            suggestions = "\n\n💡 <b>الحل:</b>\n- تأكد من فتح business.facebook.com وليس facebook.com فقط\n- تأكد من أن لديك صلاحيات BM"
+        elif 'بروكسي' in error_msg or 'proxy' in error_msg.lower() or 'connection' in error_msg.lower():
+            suggestions = "\n\n💡 <b>الحل:</b>\n- تحقق من البروكسي\n- جرب بدون بروكسي (اختر 'تخطي')\n- تحقق من الاتصال"
+        else:
+            suggestions = "\n\n💡 <b>حاول:</b>\n- نسخ الكوكيز من متصفح جديد (Chrome Incognito)\n- تأكد من الجلسة نشطة\n- جرب بدون بروكسي"
+
         await message.answer(
-            "❌ <b>الكُوكيز غير صالحة أو الجلسة غير متاحة</b>\n\n"
-            f"السبب: {validation['error']}\n\n"
-            "💡 حاول الآتي:\n"
-            "- افتح Business Manager في متصفحك وتأكد أنك مسجل دخول\n"
-            "- أعد نسخ الكوكيز من صفحة business.facebook.com\n"
-            "- إذا كنت تستخدم بروكسي، جرب اختيار 'تخطي' وإعادة المحاولة",
+            "❌ <b>الكوكيز غير صالحة أو الجلسة غير متاحة</b>\n\n"
+            f"<b>السبب:</b> {error_msg}"
+            f"{suggestions}",
             reply_markup=back_home()
         )
         return
 
-    await state.update_data(bm_cookies=cookies)
+    await state.update_data(bm_cookies=cookies_raw)
     await state.set_state(BMToolStates.waiting_bm_id)
     await message.answer(
-        "✅ <b>تم حفظ الكوكيز والتحقق منها</b>\n\n"
+        "✅ <b>تم حفظ الكوكيز والتحقق منها بنجاح!</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🔽 <b>الخطوة 3:</b> أرسل Business Manager ID\n\n"
         "📌 تجده في رابط: business.facebook.com/overview\n"
