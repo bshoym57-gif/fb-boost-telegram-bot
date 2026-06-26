@@ -38,9 +38,34 @@ def _parse_cookies(s: str) -> dict:
     return out
 
 
+def _validate_proxy_format(proxy: str) -> bool:
+    """تحقق من صيغة البروكسي بشكل أساسي."""
+    if not proxy or not isinstance(proxy, str):
+        return False
+    # يجب أن يحتوي على منفذ واحد على الأقل
+    if ':' not in proxy:
+        return False
+    # للتحقق من أنه ليس فقط أرقام متعددة بفاصلة
+    parts = proxy.split('@')
+    if len(parts) > 2:
+        return False  # أكثر من @ واحد
+    host_port = parts[-1]  # الجزء الأخير هو host:port أو IP:port
+    if ':' not in host_port:
+        return False
+    try:
+        # حاول فصل المضيف والمنفذ
+        host, port_str = host_port.rsplit(':', 1)
+        port = int(port_str)
+        return 1 <= port <= 65535
+    except (ValueError, IndexError):
+        return False
+
+
 def _get_proxies(proxy: Optional[str]) -> Optional[dict]:
     if not proxy:
         return None
+    if not _validate_proxy_format(proxy):
+        return None  # إرجاع None بدل إرسال proxies خاطئة
     if '://' not in proxy:
         proxy = f'http://{proxy}'
     return {'http://': proxy, 'https://': proxy}
