@@ -231,16 +231,16 @@ class BMCardService:
                 url_str = str(resp.url).lower()
                 
                 # علامات تدل على انتهاء الجلسة
-                session_expired_indicators = [
-                    'login', 'checkpoint', 'error', 'please log in',
-                    'session expired', 'session has expired',
-                    'must be logged in', 'requires login'
+                session_expired_url_indicators = ['login', 'checkpoint']
+                session_expired_text_indicators = [
+                    'please log in', 'session expired', 'session has expired',
+                    'must be logged in', 'requires login', 'checkpoint'
                 ]
                 
-                if any(indicator in url_str for indicator in session_expired_indicators[:3]):
+                if any(indicator in url_str for indicator in session_expired_url_indicators):
                     return {'success': False, 'error': 'الكوكيز منتهية — تحتاج تسجيل دخول من جديد'}
                 
-                if any(indicator in text.lower() for indicator in session_expired_indicators):
+                if any(indicator in text.lower() for indicator in session_expired_text_indicators):
                     return {'success': False, 'error': 'الكوكيز منتهية — تحتاج تسجيل دخول من جديد'}
                 
                 # تحقق من أن الرد من Business Manager فعلاً
