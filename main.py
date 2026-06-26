@@ -30,7 +30,7 @@ from gates.standard_ad_gate import StandardAdGate
 from gates.dark_post_gate import DarkPostGate
 from gates.partner_ship_gate import PartnerShipGate
 
-TOKEN        = ('8709244199:AAGtMXpqXVtj3KHCkcEnxa8rk3WS6KIOR1M')
+TOKEN        = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 ADMIN_PASS   = 'Nemo@1986'
 ADMIN_CMD    = 'beshoy'
 BOT_NAME     = os.environ.get('BOT_NAME',    '⚡ FB Boost Bot')
@@ -1098,7 +1098,7 @@ async def admin_broadcast(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == 'admin:settings')
 async def admin_settings(call: CallbackQuery):
-    dashboard_port = os.environ.get('DASHBOARD_PORT', '8080')
+    dashboard_port = os.environ.get('PORT', '5000')
     await call.message.edit_text(
         f"⚙️ <b>إعدادات البوت</b>\n\n"
         f"🤖 اسم البوت: <b>{BOT_NAME}</b>\n"
