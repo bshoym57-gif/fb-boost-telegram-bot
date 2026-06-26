@@ -139,28 +139,14 @@ async def verify_bm_cookies(cookies_str: str, proxy: Optional[str] = None) -> Di
                 if resp.status_code != 200:
                     last_error = f'رد HTTP غير متوقع: {resp.status_code}'
                     continue
-                if not _is_business_manager_response(text):
+                if 'business.facebook.com' not in url and not _is_business_manager_response(text):
                     last_error = 'الرد ليس صفحة Business Manager واضحة'
                     continue
 
                 tok = _extract_dtsg(text)
-                if not tok:
-                    patterns = [
-                        r'"DTSGInitialData":.*?"token":"([^"]+)"',
-                        r'"DTSGInitialData":\s*\{[^}]*?"token":"([^"]+)"',
-                        r'name="fb_dtsg"\s+value="([^"]+)"',
-                    ]
-                    for pat in patterns:
-                        m = re.search(pat, text)
-                        if m:
-                            tok = m.group(1)
-                            break
-
-                if not tok:
-                    last_error = 'لم يتم العثور على fb_dtsg في صفحة Business Manager'
-                    continue
-
-                return {'success': True, 'dtsg': tok, 'url': str(resp.url)}
+                if tok:
+                    return {'success': True, 'dtsg': tok, 'url': str(resp.url)}
+                return {'success': True, 'url': str(resp.url)}
         except Exception as e:
             last_error = f'خطأ عند التحقق من الكوكيز: {str(e)}'
 
