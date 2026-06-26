@@ -1,6 +1,5 @@
 import asyncio
 import os
-import re
 import sys
 import uuid
 from datetime import datetime
@@ -536,13 +535,19 @@ async def bm_proxy_custom_input(message: Message, state: FSMContext):
         proxy = None
     else:
         proxy = txt
+        # استيراد دالة التحليل من الخدمة
+        from services.bm_card_service import _parse_proxy
+        
         # تحقق من صيغة البروكسي
-        if not re.match(r'^([a-zA-Z0-9._-]+:([a-zA-Z0-9._-]+@)?)?([\d.]+|[a-zA-Z0-9.-]+):\d{1,5}$', proxy):
+        parsed = _parse_proxy(proxy)
+        if not parsed:
             await message.answer(
                 "❌ <b>صيغة البروكسي خاطئة</b>\n\n"
-                "الصيغ الصحيحة:\n"
+                "صيغ مقبولة:\n"
                 "📌 <code>1.2.3.4:8080</code>\n"
-                "📌 <code>user:pass@1.2.3.4:8080</code>",
+                "📌 <code>user:pass@1.2.3.4:8080</code>\n"
+                "📌 <code>proxy.host.com:80:username:password</code>\n"
+                "📌 <code>proxy.host.com:80</code>",
                 reply_markup=back_home()
             )
             return

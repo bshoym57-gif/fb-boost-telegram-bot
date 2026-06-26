@@ -38,37 +38,81 @@ def _parse_cookies(s: str) -> dict:
     return out
 
 
-def _validate_proxy_format(proxy: str) -> bool:
-    """تحقق من صيغة البروكسي بشكل أساسي."""
-    if not proxy or not isinstance(proxy, str):
-        return False
-    # يجب أن يحتوي على منفذ واحد على الأقل
-    if ':' not in proxy:
-        return False
-    # للتحقق من أنه ليس فقط أرقام متعددة بفاصلة
-    parts = proxy.split('@')
-    if len(parts) > 2:
-        return False  # أكثر من @ واحد
-    host_port = parts[-1]  # الجزء الأخير هو host:port أو IP:port
-    if ':' not in host_port:
-        return False
-    try:
-        # حاول فصل المضيف والمنفذ
-        host, port_str = host_port.rsplit(':', 1)
-        port = int(port_str)
-        return 1 <= port <= 65535
-    except (ValueError, IndexError):
-        return False
+def _parse_proxy(proxy_str: str) -> Optional[str]:
+    """
+    تحليل صيغ متعددة من البروكسي وتحويلها إلى صيغة موحدة.
+    صيغ مقبولة:
+    - IP:PORT
+    - username:password@IP:PORT
+    - hostname:port:username:password
+    - hostname:port
+    """
+    if not proxy_str or not isinstance(proxy_str, str):
+        return None
+    
+    proxy_str = proxy_str.strip()
+    
+    # إذا كان هناك @، فهو بصيغة user:pass@host:port
+    if '@' in proxy_str:
+        try:
+            credentials, host_port = proxy_str.rsplit('@', 1)
+            if ':' in host_port:
+                # تحقق من أن المنفذ صحيح
+                host, port_str = host_port.rsplit(':', 1)
+                port = int(port_str)
+                if 1 <= port <= 65535:
+                    return f"http://{credentials}@{host}:{port}"
+        except (ValueError, IndexError):
+            pass
+        return None
+    
+    # إذا لم يكن هناك @، نحاول تحليل الأجزاء
+    parts = proxy_str.split(':')
+    
+    if len(parts) == 2:
+        # host:port
+        host, port_str = parts
+        try:
+            port = int(port_str)
+            if 1 <= port <= 65535:
+                return f"http://{host}:{port}"
+        except (ValueError, IndexError):
+            pass
+    
+    elif len(parts) == 4:
+        # host:port:username:password
+        host, port_str, user, password = parts
+        try:
+            port = int(port_str)
+            if 1 <= port <= 65535:
+                return f"http://{user}:{password}@{host}:{port}"
+        except (ValueError, IndexError):
+            pass
+    
+    elif len(parts) >= 3:
+        # نحاول التحقق من آخر جزء، هل هو منفذ صحيح؟
+        try:
+            port = int(parts[-1])
+            if 1 <= port <= 65535:
+                # كل شيء ما عدا الآخر هو host (قد يحتوي على أكثر من :)
+                host = ':'.join(parts[:-1])
+                return f"http://{host}:{port}"
+        except (ValueError, IndexError):
+            pass
+    
+    return None
 
 
 def _get_proxies(proxy: Optional[str]) -> Optional[dict]:
+    """تحويل البروكسي إلى صيغة httpx."""
     if not proxy:
         return None
-    if not _validate_proxy_format(proxy):
-        return None  # إرجاع None بدل إرسال proxies خاطئة
-    if '://' not in proxy:
-        proxy = f'http://{proxy}'
-    return {'http://': proxy, 'https://': proxy}
+    
+    parsed_proxy = _parse_proxy(proxy)
+    if not parsed_proxy:
+        return None
+    
+    return {'http://': parsed_proxy, 'https://': parsed_proxy}
 
 
 def _extract_dtsg(html: str) -> Optional[str]:
