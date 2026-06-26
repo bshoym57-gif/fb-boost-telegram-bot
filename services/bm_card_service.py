@@ -198,16 +198,6 @@ def _extract_dtsg(html: str) -> Optional[str]:
                 return token
     
     return None
-        r'"DTSGInitialData"[^}]*?"token":"([^"]+)"',
-        r'name="fb_dtsg"\s+value="([^"]+)"',
-        r'"token":"(AQ[^"]{10,})"',
-        r'"fb_dtsg","([^"]+)"',
-    ]:
-        m = re.search(pat, html)
-        if m:
-            return m.group(1)
-    return None
-
 
 class BMCardService:
     def __init__(self, cookies_str: str, proxy: Optional[str] = None,
