@@ -9,6 +9,7 @@ import json
 import random
 import re
 import time
+import urllib.parse
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -165,6 +166,8 @@ def _extract_dtsg(html: str) -> Optional[str]:
         # الأنماط الشائعة
         r'"DTSGInitialData"[^}]*?"token":"([^"]+)"',
         r'"DTSGInitialData":\s*\{[^}]*?"token":"([^"]+)"',
+        r'require\(\s*["\']DTSGInitialData["\']\s*\)\.token\s*[:=]?\s*["\']([^"\']+)["\']',
+        r'DTSGInitialData\.token\s*=\s*["\']([^"\']+)["\']',
         r'name="fb_dtsg"\s+value="([^"]+)"',
         r'"fb_dtsg":"([^"]+)"',
         r'name="fb_dtsg" value="([^"]+)"',
@@ -184,6 +187,51 @@ def _extract_dtsg(html: str) -> Optional[str]:
                 return token
     
     return None
+
+
+def _extract_js_value(html: str, patterns: List[str]) -> Optional[str]:
+    for pattern in patterns:
+        match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+        if match:
+            value = match.group(1)
+            if value:
+                return value.strip().strip('"\'')
+    return None
+
+
+def _extract_bm_context(html: str) -> Dict[str, Optional[str]]:
+    context = {
+        'dtsg': _extract_dtsg(html),
+        'user_id': None,
+        'business_id': None,
+        'ad_account_id': None,
+    }
+
+    if not html or len(html) < 100:
+        return context
+
+    context['user_id'] = _extract_js_value(html, [
+        r'"CurrentUserInitialData"\s*:\s*\{[^}]*?"ACCOUNT_ID"\s*:\s*"(\d+)"',
+        r'CurrentUserInitialData\.ACCOUNT_ID\s*=\s*"(\d+)"',
+        r'CurrentUserInitialData\.ACCOUNT_ID\s*=\s*(\d+)',
+        r'"ACCOUNT_ID"\s*:\s*"(\d+)"',
+    ])
+
+    context['business_id'] = _extract_js_value(html, [
+        r'"BusinessUnifiedNavigationContext"\s*:\s*\{[^}]*?"businessID"\s*:\s*"(\d+)"',
+        r'BusinessUnifiedNavigationContext\.businessID\s*=\s*"(\d+)"',
+        r'BusinessUnifiedNavigationContext\.businessID\s*=\s*(\d+)',
+        r'"businessID"\s*:\s*"(\d+)"',
+    ])
+
+    context['ad_account_id'] = _extract_js_value(html, [
+        r'"BusinessUnifiedNavigationContext"\s*:\s*\{[^}]*?"adAccountID"\s*:\s*"(\d+)"',
+        r'BusinessUnifiedNavigationContext\.adAccountID\s*=\s*"(\d+)"',
+        r'BusinessUnifiedNavigationContext\.adAccountID\s*=\s*(\d+)',
+        r'"adAccountID"\s*:\s*"(\d+)"',
+    ])
+
+    return context
 
 class BMCardService:
     def __init__(self, cookies_str: str, proxy: Optional[str] = None,
@@ -223,6 +271,7 @@ class BMCardService:
         """جلب DTSG token من Business Manager بعد التحقق من صحة الجلسة."""
         endpoints = [
             f'{BM_BASE}/',
+            f'{BM_BASE}/overview',
             f'{BM_BASE}/billing/',
             f'{BM_BASE}/business_locations',
             f'{BM_BASE}/business_settings',
@@ -233,12 +282,21 @@ class BMCardService:
             'must be logged in', 'requires login', 'checkpoint'
         ]
 
+        checked = []
+
         try:
             async with self._client() as c:
                 for endpoint in endpoints:
                     resp = await c.get(endpoint, headers=self._headers(), cookies=self.cookies_dict)
                     text = resp.text
                     url_str = str(resp.url).lower()
+
+                    checked.append({
+                        'endpoint': endpoint,
+                        'status': resp.status_code,
+                        'final_url': url_str,
+                        'has_bm': 'business.facebook.com' in url_str or 'business.facebook.com' in text.lower(),
+                    })
 
                     if any(indicator in url_str for indicator in session_expired_url_indicators):
                         continue
@@ -247,12 +305,32 @@ class BMCardService:
                     if resp.status_code != 200:
                         continue
 
-                    tok = _extract_dtsg(text)
-                    if tok:
-                        self._dtsg = tok
-                        return {'success': True}
+                    ctx = _extract_bm_context(text)
+                    if ctx['dtsg']:
+                        self._dtsg = ctx['dtsg']
+                        if ctx['user_id']:
+                            self._user_id = ctx['user_id']
+                        return {
+                            'success': True,
+                            'endpoint': endpoint,
+                            'dtsg': self._dtsg,
+                            'user_id': self._user_id,
+                            'business_id': ctx['business_id'],
+                            'ad_account_id': ctx['ad_account_id'],
+                        }
 
-                return {'success': False, 'error': 'الكوكيز منتهية — تحتاج تسجيل دخول من جديد'}
+                if any(item['has_bm'] for item in checked):
+                    return {
+                        'success': False,
+                        'error': 'لم نتمكن من استخراج DTSG من صفحات Business Manager. تأكد من أن الكوكيز تحتوي على جلسة صالحة.',
+                        'details': checked,
+                    }
+
+                return {
+                    'success': False,
+                    'error': 'فشل الوصول إلى Business Manager باستخدام هذه الكوكيز. قد تكون الجلسة غير نشطة أو أن الكوكيز غير كاملة.',
+                    'details': checked,
+                }
         except Exception as e:
             error_str = str(e)
             if 'timeout' in error_str.lower():
@@ -261,24 +339,35 @@ class BMCardService:
                 return {'success': False, 'error': f'مشكلة في الاتصال/البروكسي: {error_str[:100]}'}
             return {'success': False, 'error': f'خطأ في الاتصال: {error_str}'}
     async def _gql(self, friendly: str, doc_id: str, variables: dict,
-                   bm_id: str, ad_id: str) -> Dict[str, Any]:
-        body = '&'.join([
-            f'av={self._user_id}',
-            f'__aaid={ad_id}',
-            f'__bid={bm_id}',
-            f'__user={self._user_id}',
-            '__a=1',
-            f'fb_dtsg={self._dtsg}',
-            'fb_api_caller_class=RelayModern',
-            f'fb_api_req_friendly_name={friendly}',
-            f'variables={json.dumps(variables)}',
-            f'doc_id={doc_id}',
-        ])
+                     bm_id: str, ad_id: str) -> Dict[str, Any]:
+        query_params = {}
+        if friendly == 'BillingHubPaymentMethodsViewQuery':
+            query_params = {'_callFlowletID': '0', '_triggerFlowletID': '2596'}
+        elif friendly == 'BillingHubPaymentMethodsBusinessSectionQuery':
+            query_params = {'_callFlowletID': '0', '_triggerFlowletID': '1'}
+
+        url = GRAPHQL
+        if query_params:
+            url = f"{GRAPHQL}?{urllib.parse.urlencode(query_params)}"
+
+        body_dict = {
+            'av': self._user_id,
+            '__aaid': ad_id,
+            '__bid': bm_id,
+            '__user': self._user_id,
+            '__a': '1',
+            'fb_dtsg': self._dtsg,
+            'fb_api_caller_class': 'RelayModern',
+            'fb_api_req_friendly_name': friendly,
+            'variables': json.dumps(variables),
+            'doc_id': doc_id,
+        }
+        body = urllib.parse.urlencode(body_dict)
         try:
             async with self._client() as c:
-                resp = await c.post(GRAPHQL, headers=self._headers(),
+                resp = await c.post(url, headers=self._headers(),
                                     cookies=self.cookies_dict, content=body)
-                
+
                 # تحقق من حالة الاستجابة
                 if resp.status_code == 401:
                     return {'success': False, 'error': 'الكوكيز منتهية - تحتاج تسجيل دخول من جديد (401)'}
@@ -286,7 +375,7 @@ class BMCardService:
                     return {'success': False, 'error': 'الوصول مرفوض - قد تحتاج إلى سلطات إضافية (403)'}
                 elif resp.status_code >= 500:
                     return {'success': False, 'error': f'خطأ الخادم ({resp.status_code})'}
-                
+
                 try:
                     data = resp.json()
                     return {'success': True, 'data': data}
