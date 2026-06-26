@@ -10,6 +10,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.fsm.context import FSMContext
 
 from database import DB, is_subscribed
@@ -56,7 +57,9 @@ GATES = {
 }
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode='HTML'))
-dp  = Dispatcher(storage=MemoryStorage())
+redis_url = os.environ.get('REDIS_URL', '')
+storage = RedisStorage.from_url(redis_url) if redis_url else MemoryStorage()
+dp  = Dispatcher(storage=storage)
 
 # ─── جدول الجلسات النشطة: user_id → session_token ───
 _sessions: dict[int, str] = {}
