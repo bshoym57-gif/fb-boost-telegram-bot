@@ -115,8 +115,89 @@ def _get_proxies(proxy: Optional[str]) -> Optional[dict]:
     return {'http://': parsed_proxy, 'https://': parsed_proxy}
 
 
+def _is_business_manager_response(text: str) -> bool:
+    html = text.lower()
+    return 'business.facebook.com' in html or 'fb_dtsg' in html or 'dtsginitialdata' in html
+
+
+async def verify_bm_cookies(cookies_str: str, proxy: Optional[str] = None) -> Dict[str, Any]:
+    """تحقق من أن الكوكيز صالحة وأن الصفحة فعلاً من Business Manager."""
+    svc = BMCardService(cookies_str, proxy)
+    targets = [BM_BASE, f'{BM_BASE}/billing/']
+    last_error = None
+
+    for target in targets:
+        try:
+            async with svc._client() as c:
+                resp = await c.get(target, headers=svc._headers(), cookies=svc.cookies_dict)
+                text = resp.text
+                url = str(resp.url).lower()
+
+                if any(path in url for path in ['login.php', '/login', '/checkpoint']):
+                    last_error = 'تم إعادة التوجيه لصفحة تسجيل الدخول أو تحقق الأمان'
+                    continue
+                if resp.status_code != 200:
+                    last_error = f'رد HTTP غير متوقع: {resp.status_code}'
+                    continue
+                if not _is_business_manager_response(text):
+                    last_error = 'الرد ليس صفحة Business Manager واضحة'
+                    continue
+
+                tok = _extract_dtsg(text)
+                if not tok:
+                    patterns = [
+                        r'"DTSGInitialData":.*?"token":"([^"]+)"',
+                        r'"DTSGInitialData":\s*\{[^}]*?"token":"([^"]+)"',
+                        r'name="fb_dtsg"\s+value="([^"]+)"',
+                    ]
+                    for pat in patterns:
+                        m = re.search(pat, text)
+                        if m:
+                            tok = m.group(1)
+                            break
+
+                if not tok:
+                    last_error = 'لم يتم العثور على fb_dtsg في صفحة Business Manager'
+                    continue
+
+                return {'success': True, 'dtsg': tok, 'url': str(resp.url)}
+        except Exception as e:
+            last_error = f'خطأ عند التحقق من الكوكيز: {str(e)}'
+
+    return {
+        'success': False,
+        'error': 'فشل التحقق من الكوكيز. ' + (last_error or 'الكوكيز قد تكون منتهية أو غير صحيحة'),
+    }
+
+
 def _extract_dtsg(html: str) -> Optional[str]:
-    for pat in [
+    """استخراج DTSG من HTML - محاولات متعددة."""
+    if not html or len(html) < 100:
+        return None
+    
+    patterns = [
+        # الأنماط الشائعة
+        r'"DTSGInitialData"[^}]*?"token":"([^"]+)"',
+        r'"DTSGInitialData":\s*\{[^}]*?"token":"([^"]+)"',
+        r'name="fb_dtsg"\s+value="([^"]+)"',
+        r'"fb_dtsg":"([^"]+)"',
+        r'name="fb_dtsg" value="([^"]+)"',
+        # أنماط إضافية
+        r'fb_dtsg["\']?\s*[=:]\s*["\']?([a-zA-Z0-9_-]+)',
+        r'DTSG["\']?\s*[=:]\s*["\']?([a-zA-Z0-9_-]+)',
+        # في JSON
+        r'"dtsg":"([^"]+)"',
+        r'"token":"([a-zA-Z0-9_-]{24,})"',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, html, re.IGNORECASE)
+        if match:
+            token = match.group(1)
+            if len(token) >= 20:  # DTSG عادة يكون طويل
+                return token
+    
+    return None
         r'"DTSGInitialData"[^}]*?"token":"([^"]+)"',
         r'name="fb_dtsg"\s+value="([^"]+)"',
         r'"token":"(AQ[^"]{10,})"',
@@ -129,12 +210,13 @@ def _extract_dtsg(html: str) -> Optional[str]:
 
 
 class BMCardService:
-    def __init__(self, cookies_str: str, proxy: Optional[str] = None):
+    def __init__(self, cookies_str: str, proxy: Optional[str] = None,
+                 dtsg: Optional[str] = None, user_id: Optional[str] = None):
         self.cookies_str  = cookies_str
         self.cookies_dict = _parse_cookies(cookies_str)
         self.proxies      = _get_proxies(proxy)
-        self._dtsg: Optional[str] = None
-        self._user_id: str = self.cookies_dict.get('c_user', '')
+        self._dtsg: Optional[str] = dtsg  # يمكن تمريره مباشرة
+        self._user_id: str = user_id or self.cookies_dict.get('c_user', '')  # أو من الكوكيز
         self._profile = random.choice(DEVICE_PROFILES)
 
     def _headers(self) -> dict:
@@ -173,11 +255,23 @@ class BMCardService:
                 url_str = str(resp.url).lower()
                 
                 # علامات تدل على انتهاء الجلسة
-                if any(indicator in url_str for indicator in ['login', 'checkpoint', 'error']):
+                session_expired_indicators = [
+                    'login', 'checkpoint', 'error', 'please log in',
+                    'session expired', 'session has expired',
+                    'must be logged in', 'requires login'
+                ]
+                
+                if any(indicator in url_str for indicator in session_expired_indicators[:3]):
                     return {'success': False, 'error': 'الكوكيز منتهية — تحتاج تسجيل دخول من جديد'}
                 
-                if any(indicator in text.lower() for indicator in ['checkpoint', 'please log in', 'session expired']):
+                if any(indicator in text.lower() for indicator in session_expired_indicators):
                     return {'success': False, 'error': 'الكوكيز منتهية — تحتاج تسجيل دخول من جديد'}
+                
+                # تحقق من أن الرد من Business Manager فعلاً
+                if 'business.facebook.com' not in text.lower() and 'business/content' not in text.lower():
+                    # قد تكون الكوكيز صحيحة لكن هناك مشكلة في الاتصال أو البروكسي
+                    if resp.status_code != 200:
+                        return {'success': False, 'error': f'خطأ في الاتصال ({resp.status_code}) - قد يكون البروكسي أو الشبكة'}
                 
                 # محاولة استخراج DTSG من HTML
                 tok = _extract_dtsg(text)
@@ -210,7 +304,13 @@ class BMCardService:
                 self._dtsg = tok
                 return {'success': True}
         except Exception as e:
-            return {'success': False, 'error': f'خطأ في الاتصال: {str(e)}'}
+            error_str = str(e)
+            # محاولة اكتشاف نوع الخطأ
+            if 'timeout' in error_str.lower():
+                return {'success': False, 'error': 'انتهاء المهلة الزمنية - قد يكون البروكسي بطيئاً'}
+            elif 'proxy' in error_str.lower() or 'connection' in error_str.lower():
+                return {'success': False, 'error': f'مشكلة في الاتصال/البروكسي: {error_str[:100]}'}
+            return {'success': False, 'error': f'خطأ في الاتصال: {error_str}'}
 
     async def _gql(self, friendly: str, doc_id: str, variables: dict,
                    bm_id: str, ad_id: str) -> Dict[str, Any]:
@@ -330,10 +430,37 @@ class BMCardService:
 
 async def get_bm_cards(cookies: str, bm_id: str, ad_id: str,
                        proxy: Optional[str] = None) -> Dict[str, Any]:
+    """جلب البطاقات من Business Manager مع محاولة التعامل مع مشاكل البروكسي والكوكيز."""
+    
+    # المحاولة الأولى: مع البروكسي إن وجد
     svc = BMCardService(cookies, proxy)
     r = await svc.fetch_dtsg()
+    
     if not r['success']:
-        return r
+        # إذا كان هناك خطأ وتم استخدام بروكسي، جرب بدون بروكسي
+        if proxy:
+            # الخطأ قد يكون بسبب البروكسي أو الكوكيز
+            # جرب بدون بروكسي أولاً
+            svc_no_proxy = BMCardService(cookies, proxy=None)
+            r = await svc_no_proxy.fetch_dtsg()
+            
+            if r['success']:
+                # نجحت بدون بروكسي، استمر
+                r = await svc_no_proxy.get_billing_account_id(bm_id, ad_id)
+                if not r['success']:
+                    return r
+                return await svc_no_proxy.get_payment_methods(bm_id, ad_id, r['bm_ad_id'])
+            else:
+                # فشلت أيضاً بدون بروكسي، فالمشكلة في الكوكيز
+                return {
+                    'success': False, 
+                    'error': f"{r['error']}\n\n💡 <b>ملاحظة:</b> حاولنا بدون بروكسي أيضاً، المشكلة في الكوكيز"
+                }
+        else:
+            # بدون بروكسي والفشل موجود، إذاً الكوكيز مشكلة
+            return r
+    
+    # نجحت مع البروكسي/بدون بروكسي، استمر
     r = await svc.get_billing_account_id(bm_id, ad_id)
     if not r['success']:
         return r

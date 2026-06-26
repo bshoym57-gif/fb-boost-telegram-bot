@@ -571,10 +571,28 @@ async def bm_cookies_input(message: Message, state: FSMContext):
             reply_markup=back_home()
         )
         return
+
+    data = await state.get_data()
+    proxy = data.get('bm_proxy')
+
+    from services.bm_card_service import verify_bm_cookies
+    validation = await verify_bm_cookies(cookies, proxy=proxy)
+    if not validation['success']:
+        await message.answer(
+            "❌ <b>الكُوكيز غير صالحة أو الجلسة غير متاحة</b>\n\n"
+            f"السبب: {validation['error']}\n\n"
+            "💡 حاول الآتي:\n"
+            "- افتح Business Manager في متصفحك وتأكد أنك مسجل دخول\n"
+            "- أعد نسخ الكوكيز من صفحة business.facebook.com\n"
+            "- إذا كنت تستخدم بروكسي، جرب اختيار 'تخطي' وإعادة المحاولة",
+            reply_markup=back_home()
+        )
+        return
+
     await state.update_data(bm_cookies=cookies)
     await state.set_state(BMToolStates.waiting_bm_id)
     await message.answer(
-        "✅ <b>تم حفظ الكوكيز</b>\n\n"
+        "✅ <b>تم حفظ الكوكيز والتحقق منها</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🔽 <b>الخطوة 3:</b> أرسل Business Manager ID\n\n"
         "📌 تجده في رابط: business.facebook.com/overview\n"
@@ -628,14 +646,20 @@ async def bm_ad_id_input(message: Message, state: FSMContext):
     if not result['success']:
         error_msg = result['error']
         suggestions = ""
+        proxy_used = data.get('bm_proxy')
         
         # أضف اقتراحات بناءً على نوع الخطأ
         if 'منتهية' in error_msg or 'login' in error_msg.lower():
             suggestions = "\n\n💡 <b>الحل:</b>\n- تأكد من أن الجلسة لا تزال نشطة\n- حاول تحديث الكوكيز من جديد\n- تسجيل الدخول في متصفح جديد وإعادة نسخ الكوكيز"
+            if proxy_used:
+                suggestions += "\n- جرب بدون بروكسي"
         elif 'dtsg' in error_msg.lower():
             suggestions = "\n\n💡 <b>الحل:</b>\n- تأكد من أن الكوكيز صحيحة\n- حاول نسخ الكوكيز مرة أخرى من متصفح جديد\n- تأكد من أن لديك صلاحيات في Business Manager"
-        elif 'شبكة' in error_msg or 'network' in error_msg.lower():
-            suggestions = "\n\n💡 <b>الحل:</b>\n- تحقق من اتصال الإنترنت\n- تحقق من صحة البروكسي إن وجد\n- حاول بدون بروكسي"
+        elif 'شبكة' in error_msg or 'network' in error_msg.lower() or 'proxy' in error_msg.lower() or 'timeout' in error_msg.lower():
+            suggestions = "\n\n💡 <b>الحل:</b>\n- تحقق من اتصال الإنترنت\n- تحقق من صحة البروكسي إن وجد"
+            if proxy_used:
+                suggestions += "\n- جرب بدون بروكسي: اختر 'تخطي'"
+            suggestions += "\n- حاول بدون بروكسي"
         
         await wait_msg.edit_text(
             f"❌ <b>فشل جلب البطاقات</b>\n\n"

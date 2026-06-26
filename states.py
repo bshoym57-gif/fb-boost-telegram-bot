@@ -102,12 +102,14 @@ class AdObjectives:
 
 
 class BMToolStates(StatesGroup):
-    waiting_proxy    = State()
-    waiting_cookies  = State()
-    waiting_bm_id    = State()
-    waiting_ad_id    = State()
-    waiting_card_sel = State()
-    waiting_interval = State()
+    waiting_proxy      = State()
+    waiting_cookies    = State()
+    waiting_bm_id      = State()
+    waiting_ad_id      = State()
+    waiting_dtsg       = State()  # اختياري: إدخال DTSG يدوي
+    waiting_user_id    = State()  # اختياري: إدخال User ID يدوي
+    waiting_card_sel   = State()
+    waiting_interval   = State()
 
 
 class GateConstants:
