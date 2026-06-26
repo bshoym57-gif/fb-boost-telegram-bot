@@ -626,9 +626,21 @@ async def bm_ad_id_input(message: Message, state: FSMContext):
     )
 
     if not result['success']:
+        error_msg = result['error']
+        suggestions = ""
+        
+        # أضف اقتراحات بناءً على نوع الخطأ
+        if 'منتهية' in error_msg or 'login' in error_msg.lower():
+            suggestions = "\n\n💡 <b>الحل:</b>\n- تأكد من أن الجلسة لا تزال نشطة\n- حاول تحديث الكوكيز من جديد\n- تسجيل الدخول في متصفح جديد وإعادة نسخ الكوكيز"
+        elif 'dtsg' in error_msg.lower():
+            suggestions = "\n\n💡 <b>الحل:</b>\n- تأكد من أن الكوكيز صحيحة\n- حاول نسخ الكوكيز مرة أخرى من متصفح جديد\n- تأكد من أن لديك صلاحيات في Business Manager"
+        elif 'شبكة' in error_msg or 'network' in error_msg.lower():
+            suggestions = "\n\n💡 <b>الحل:</b>\n- تحقق من اتصال الإنترنت\n- تحقق من صحة البروكسي إن وجد\n- حاول بدون بروكسي"
+        
         await wait_msg.edit_text(
             f"❌ <b>فشل جلب البطاقات</b>\n\n"
-            f"السبب: {result['error']}",
+            f"<b>السبب:</b> {error_msg}"
+            f"{suggestions}",
             reply_markup=back_home()
         )
         return

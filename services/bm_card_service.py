@@ -139,13 +139,19 @@ class BMCardService:
 
     def _headers(self) -> dict:
         return {
-            'User-Agent':       self._profile['ua'],
-            'Accept':           '*/*',
-            'Accept-Language':  self._profile['lang'],
-            'Content-Type':     'application/x-www-form-urlencoded',
-            'Origin':           BM_BASE,
-            'Referer':          f'{BM_BASE}/billing/',
-            'X-Requested-With': 'XMLHttpRequest',
+            'User-Agent':            self._profile['ua'],
+            'Accept':                'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language':       self._profile['lang'],
+            'Accept-Encoding':       'gzip, deflate, br',
+            'Content-Type':          'application/x-www-form-urlencoded',
+            'Origin':                BM_BASE,
+            'Referer':               f'{BM_BASE}/billing/',
+            'Sec-Fetch-Dest':        'document',
+            'Sec-Fetch-Mode':        'navigate',
+            'Sec-Fetch-Site':        'same-origin',
+            'Cache-Control':         'max-age=0',
+            'X-Requested-With':      'XMLHttpRequest',
+            'Pragma':                'no-cache',
         }
 
     def _client(self) -> httpx.AsyncClient:
@@ -156,20 +162,55 @@ class BMCardService:
         )
 
     async def fetch_dtsg(self) -> Dict[str, Any]:
+        """جلب DTSG token من Business Manager بعد التحقق من صحة الجلسة."""
         try:
             async with self._client() as c:
                 resp = await c.get(f'{BM_BASE}/', headers=self._headers(),
                                    cookies=self.cookies_dict)
+                
+                # تحقق من حالة الاستجابة
                 text = resp.text
-                if 'login' in str(resp.url).lower() or 'checkpoint' in text.lower():
+                url_str = str(resp.url).lower()
+                
+                # علامات تدل على انتهاء الجلسة
+                if any(indicator in url_str for indicator in ['login', 'checkpoint', 'error']):
                     return {'success': False, 'error': 'الكوكيز منتهية — تحتاج تسجيل دخول من جديد'}
+                
+                if any(indicator in text.lower() for indicator in ['checkpoint', 'please log in', 'session expired']):
+                    return {'success': False, 'error': 'الكوكيز منتهية — تحتاج تسجيل دخول من جديد'}
+                
+                # محاولة استخراج DTSG من HTML
                 tok = _extract_dtsg(text)
                 if not tok:
-                    return {'success': False, 'error': 'لم يتم العثور على fb_dtsg — تحقق من الكوكيز'}
+                    # قد يكون HTML أو JSON
+                    dtsg_patterns = [
+                        r'"DTSGInitialData":.*?"token":"([^"]+)"',
+                        r'"DTSGInitialData":\s*\{[^}]*?"token":"([^"]+)"',
+                        r'name="fb_dtsg"\s+value="([^"]+)"',
+                    ]
+                    for pattern in dtsg_patterns:
+                        match = re.search(pattern, text)
+                        if match:
+                            tok = match.group(1)
+                            break
+                
+                if not tok:
+                    # إذا لم نجد DTSG، قد تكون هناك مشكلة في الكوكيز
+                    error_msgs = []
+                    if len(text) < 500:
+                        error_msgs.append(f'رد صغير جداً ({len(text)} حرف)')
+                    if 'facebook' not in text.lower():
+                        error_msgs.append('الرد ليس من Facebook')
+                    if 'business' not in text.lower():
+                        error_msgs.append('لم يتم العثور على صفحة Business Manager')
+                    
+                    error_info = ' + '.join(error_msgs) if error_msgs else 'الكوكيز قد تكون غير صحيحة أو منتهية الصلاحية'
+                    return {'success': False, 'error': f'لم يتم العثور على fb_dtsg — {error_info}'}
+                
                 self._dtsg = tok
                 return {'success': True}
         except Exception as e:
-            return {'success': False, 'error': f'خطأ في الاتصال: {e}'}
+            return {'success': False, 'error': f'خطأ في الاتصال: {str(e)}'}
 
     async def _gql(self, friendly: str, doc_id: str, variables: dict,
                    bm_id: str, ad_id: str) -> Dict[str, Any]:
@@ -189,12 +230,22 @@ class BMCardService:
             async with self._client() as c:
                 resp = await c.post(GRAPHQL, headers=self._headers(),
                                     cookies=self.cookies_dict, content=body)
+                
+                # تحقق من حالة الاستجابة
+                if resp.status_code == 401:
+                    return {'success': False, 'error': 'الكوكيز منتهية - تحتاج تسجيل دخول من جديد (401)'}
+                elif resp.status_code == 403:
+                    return {'success': False, 'error': 'الوصول مرفوض - قد تحتاج إلى سلطات إضافية (403)'}
+                elif resp.status_code >= 500:
+                    return {'success': False, 'error': f'خطأ الخادم ({resp.status_code})'}
+                
                 try:
-                    return {'success': True, 'data': resp.json()}
+                    data = resp.json()
+                    return {'success': True, 'data': data}
                 except Exception:
                     return {'success': False, 'error': f'رد غير JSON ({resp.status_code}): {resp.text[:200]}'}
         except Exception as e:
-            return {'success': False, 'error': f'خطأ شبكة: {e}'}
+            return {'success': False, 'error': f'خطأ شبكة: {str(e)}'}
 
     async def get_billing_account_id(self, bm_id: str, ad_id: str) -> Dict[str, Any]:
         r = await self._gql(
