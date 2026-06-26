@@ -221,73 +221,45 @@ class BMCardService:
 
     async def fetch_dtsg(self) -> Dict[str, Any]:
         """جلب DTSG token من Business Manager بعد التحقق من صحة الجلسة."""
+        endpoints = [
+            f'{BM_BASE}/',
+            f'{BM_BASE}/billing/',
+            f'{BM_BASE}/business_locations',
+            f'{BM_BASE}/business_settings',
+        ]
+        session_expired_url_indicators = ['login', 'checkpoint']
+        session_expired_text_indicators = [
+            'please log in', 'session expired', 'session has expired',
+            'must be logged in', 'requires login', 'checkpoint'
+        ]
+
         try:
             async with self._client() as c:
-                resp = await c.get(f'{BM_BASE}/', headers=self._headers(),
-                                   cookies=self.cookies_dict)
-                
-                # تحقق من حالة الاستجابة
-                text = resp.text
-                url_str = str(resp.url).lower()
-                
-                # علامات تدل على انتهاء الجلسة
-                session_expired_url_indicators = ['login', 'checkpoint']
-                session_expired_text_indicators = [
-                    'please log in', 'session expired', 'session has expired',
-                    'must be logged in', 'requires login', 'checkpoint'
-                ]
-                
-                if any(indicator in url_str for indicator in session_expired_url_indicators):
-                    return {'success': False, 'error': 'الكوكيز منتهية — تحتاج تسجيل دخول من جديد'}
-                
-                if any(indicator in text.lower() for indicator in session_expired_text_indicators):
-                    return {'success': False, 'error': 'الكوكيز منتهية — تحتاج تسجيل دخول من جديد'}
-                
-                # تحقق من أن الرد من Business Manager فعلاً
-                if 'business.facebook.com' not in text.lower() and 'business/content' not in text.lower():
-                    # قد تكون الكوكيز صحيحة لكن هناك مشكلة في الاتصال أو البروكسي
+                for endpoint in endpoints:
+                    resp = await c.get(endpoint, headers=self._headers(), cookies=self.cookies_dict)
+                    text = resp.text
+                    url_str = str(resp.url).lower()
+
+                    if any(indicator in url_str for indicator in session_expired_url_indicators):
+                        continue
+                    if any(indicator in text.lower() for indicator in session_expired_text_indicators):
+                        continue
                     if resp.status_code != 200:
-                        return {'success': False, 'error': f'خطأ في الاتصال ({resp.status_code}) - قد يكون البروكسي أو الشبكة'}
-                
-                # محاولة استخراج DTSG من HTML
-                tok = _extract_dtsg(text)
-                if not tok:
-                    # قد يكون HTML أو JSON
-                    dtsg_patterns = [
-                        r'"DTSGInitialData":.*?"token":"([^"]+)"',
-                        r'"DTSGInitialData":\s*\{[^}]*?"token":"([^"]+)"',
-                        r'name="fb_dtsg"\s+value="([^"]+)"',
-                    ]
-                    for pattern in dtsg_patterns:
-                        match = re.search(pattern, text)
-                        if match:
-                            tok = match.group(1)
-                            break
-                
-                if not tok:
-                    # إذا لم نجد DTSG، قد تكون هناك مشكلة في الكوكيز
-                    error_msgs = []
-                    if len(text) < 500:
-                        error_msgs.append(f'رد صغير جداً ({len(text)} حرف)')
-                    if 'facebook' not in text.lower():
-                        error_msgs.append('الرد ليس من Facebook')
-                    if 'business' not in text.lower():
-                        error_msgs.append('لم يتم العثور على صفحة Business Manager')
-                    
-                    error_info = ' + '.join(error_msgs) if error_msgs else 'الكوكيز قد تكون غير صحيحة أو منتهية الصلاحية'
-                    return {'success': False, 'error': f'لم يتم العثور على fb_dtsg — {error_info}'}
-                
-                self._dtsg = tok
-                return {'success': True}
+                        continue
+
+                    tok = _extract_dtsg(text)
+                    if tok:
+                        self._dtsg = tok
+                        return {'success': True}
+
+                return {'success': False, 'error': 'الكوكيز منتهية — تحتاج تسجيل دخول من جديد'}
         except Exception as e:
             error_str = str(e)
-            # محاولة اكتشاف نوع الخطأ
             if 'timeout' in error_str.lower():
                 return {'success': False, 'error': 'انتهاء المهلة الزمنية - قد يكون البروكسي بطيئاً'}
             elif 'proxy' in error_str.lower() or 'connection' in error_str.lower():
                 return {'success': False, 'error': f'مشكلة في الاتصال/البروكسي: {error_str[:100]}'}
             return {'success': False, 'error': f'خطأ في الاتصال: {error_str}'}
-
     async def _gql(self, friendly: str, doc_id: str, variables: dict,
                    bm_id: str, ad_id: str) -> Dict[str, Any]:
         body = '&'.join([
