@@ -30,13 +30,79 @@ DEVICE_PROFILES = [
 
 
 def _parse_cookies(s: str) -> dict:
-    out = {}
-    for part in s.split(';'):
+    """
+    تحليل الكوكيز من أي تنسيق:
+      - semicolon-separated: a=1;b=2
+      - newline-separated: a=1\nb=2
+      - comma-separated: a=1, b=2
+      - with Cookie: prefix
+      - with URL-encoded values
+      - JSON values inside cookies
+    """
+    if not s or not isinstance(s, str):
+        return {}
+
+    s = s.strip()
+    if not s:
+        return {}
+
+    # إزالة prefix "Cookie:" لو موجود
+    if s.lower().startswith('cookie:'):
+        s = s[7:]
+
+    # استبدال newlines بـ ;
+    s = s.replace('\n', ';').replace('\r', '')
+
+    # إذا كان التنسيق JSON dict مباشر
+    if s.startswith('{') and s.endswith('}'):
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, dict):
+                return {str(k).strip(): str(v).strip() for k, v in parsed.items()}
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    result = {}
+    # تقسيم على ; أولاً
+    parts = s.split(';')
+
+    for part in parts:
         part = part.strip()
-        if '=' in part:
-            k, v = part.split('=', 1)
-            out[k.strip()] = v.strip()
-    return out
+        if not part:
+            continue
+
+        # تجاهل attributes زي Secure, HttpOnly, SameSite, Path, Domain, Expires
+        skip_attrs = ['secure', 'httponly', 'samesite', 'path', 'domain', 'expires',
+                      'max-age', 'partitioned', 'priority']
+        lower_part = part.lower().split('=')[0].strip()
+        if lower_part in skip_attrs:
+            continue
+
+        if '=' not in part:
+            continue
+
+        # نستخدم partition عشان نتعامل مع = داخل القيمة
+        key, sep, value = part.partition('=')
+        key = key.strip()
+        value = value.strip()
+
+        if not key:
+            continue
+
+        # URL decode للقيمة (ممكن تكون encoded من المتصفح)
+        try:
+            decoded = urllib.parse.unquote(value)
+            value = decoded
+        except Exception:
+            pass
+
+        # إزالة quotes حول القيمة
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+
+        result[key] = value
+
+    return result
 
 
 def _parse_proxy(proxy_str: str) -> Optional[str]:
@@ -50,9 +116,9 @@ def _parse_proxy(proxy_str: str) -> Optional[str]:
     """
     if not proxy_str or not isinstance(proxy_str, str):
         return None
-    
+
     proxy_str = proxy_str.strip()
-    
+
     # إذا كان هناك @، فهو بصيغة user:pass@host:port
     if '@' in proxy_str:
         try:
@@ -66,10 +132,10 @@ def _parse_proxy(proxy_str: str) -> Optional[str]:
         except (ValueError, IndexError):
             pass
         return None
-    
+
     # إذا لم يكن هناك @، نحاول تحليل الأجزاء
     parts = proxy_str.split(':')
-    
+
     if len(parts) == 2:
         # host:port
         host, port_str = parts
@@ -79,7 +145,7 @@ def _parse_proxy(proxy_str: str) -> Optional[str]:
                 return f"http://{host}:{port}"
         except (ValueError, IndexError):
             pass
-    
+
     elif len(parts) == 4:
         # host:port:username:password
         host, port_str, user, password = parts
@@ -89,7 +155,7 @@ def _parse_proxy(proxy_str: str) -> Optional[str]:
                 return f"http://{user}:{password}@{host}:{port}"
         except (ValueError, IndexError):
             pass
-    
+
     elif len(parts) >= 3:
         # نحاول التحقق من آخر جزء، هل هو منفذ صحيح؟
         try:
@@ -100,7 +166,7 @@ def _parse_proxy(proxy_str: str) -> Optional[str]:
                 return f"http://{host}:{port}"
         except (ValueError, IndexError):
             pass
-    
+
     return None
 
 
@@ -108,11 +174,11 @@ def _get_proxies(proxy: Optional[str]) -> Optional[dict]:
     """تحويل البروكسي إلى صيغة httpx."""
     if not proxy:
         return None
-    
+
     parsed_proxy = _parse_proxy(proxy)
     if not parsed_proxy:
         return None
-    
+
     return {'http://': parsed_proxy, 'https://': parsed_proxy}
 
 
@@ -121,8 +187,37 @@ def _is_business_manager_response(text: str) -> bool:
     return 'business.facebook.com' in html or 'fb_dtsg' in html or 'dtsginitialdata' in html
 
 
+def _validate_cookie_keys(cookies_dict: dict) -> dict:
+    """التحقق من وجود المفاتيح الأساسية والحساسة."""
+    result = {
+        'has_c_user': 'c_user' in cookies_dict and bool(cookies_dict['c_user']),
+        'has_xs': 'xs' in cookies_dict and bool(cookies_dict['xs']),
+        'has_datr': 'datr' in cookies_dict and bool(cookies_dict['datr']),
+        'has_sb': 'sb' in cookies_dict and bool(cookies_dict['sb']),
+        'total_keys': len(cookies_dict),
+    }
+    result['looks_valid'] = result['has_c_user'] and result['has_xs']
+    return result
+
+
 async def verify_bm_cookies(cookies_str: str, proxy: Optional[str] = None) -> Dict[str, Any]:
     """تحقق من أن الكوكيز صالحة وأن الصفحة فعلاً من Business Manager."""
+    parsed = _parse_cookies(cookies_str)
+
+    # التحقق الأساسي من المفاتيح المهمة
+    validation = _validate_cookie_keys(parsed)
+    if not validation['looks_valid']:
+        missing = []
+        if not validation['has_c_user']:
+            missing.append('c_user')
+        if not validation['has_xs']:
+            missing.append('xs')
+        return {
+            'success': False,
+            'error': f'الكوكيز ناقصة - مفاتيح أساسية مفقودة: {", ".join(missing)}. '
+                     f'تأكد من نسخ الكوكيز كاملة من المتصفح (Developer Tools → Network → Cookies)'
+        }
+
     svc = BMCardService(cookies_str, proxy)
     targets = [BM_BASE, f'{BM_BASE}/billing/']
     last_error = None
@@ -135,7 +230,7 @@ async def verify_bm_cookies(cookies_str: str, proxy: Optional[str] = None) -> Di
                 url = str(resp.url).lower()
 
                 if any(path in url for path in ['login.php', '/login', '/checkpoint']):
-                    last_error = 'تم إعادة التوجيه لصفحة تسجيل الدخول أو تحقق الأمان'
+                    last_error = 'تم إعادة التوجيه لصفحة تسجيل الدخول أو تحقق الأمان - الكوكيز منتهية'
                     continue
                 if resp.status_code != 200:
                     last_error = f'رد HTTP غير متوقع: {resp.status_code}'
@@ -161,7 +256,7 @@ def _extract_dtsg(html: str) -> Optional[str]:
     """استخراج DTSG من HTML - محاولات متعددة."""
     if not html or len(html) < 100:
         return None
-    
+
     patterns = [
         # الأنماط الشائعة
         r'"DTSGInitialData"[^}]*?"token":"([^"]+)"',
@@ -178,14 +273,14 @@ def _extract_dtsg(html: str) -> Optional[str]:
         r'"dtsg":"([^"]+)"',
         r'"token":"([a-zA-Z0-9_-]{24,})"',
     ]
-    
+
     for pattern in patterns:
         match = re.search(pattern, html, re.IGNORECASE)
         if match:
             token = match.group(1)
             if len(token) >= 20:  # DTSG عادة يكون طويل
                 return token
-    
+
     return None
 
 
@@ -468,11 +563,11 @@ class BMCardService:
 async def get_bm_cards(cookies: str, bm_id: str, ad_id: str,
                        proxy: Optional[str] = None) -> Dict[str, Any]:
     """جلب البطاقات من Business Manager مع محاولة التعامل مع مشاكل البروكسي والكوكيز."""
-    
+
     # المحاولة الأولى: مع البروكسي إن وجد
     svc = BMCardService(cookies, proxy)
     r = await svc.fetch_dtsg()
-    
+
     if not r['success']:
         # إذا كان هناك خطأ وتم استخدام بروكسي، جرب بدون بروكسي
         if proxy:
@@ -480,7 +575,7 @@ async def get_bm_cards(cookies: str, bm_id: str, ad_id: str,
             # جرب بدون بروكسي أولاً
             svc_no_proxy = BMCardService(cookies, proxy=None)
             r = await svc_no_proxy.fetch_dtsg()
-            
+
             if r['success']:
                 # نجحت بدون بروكسي، استمر
                 r = await svc_no_proxy.get_billing_account_id(bm_id, ad_id)
@@ -490,13 +585,13 @@ async def get_bm_cards(cookies: str, bm_id: str, ad_id: str,
             else:
                 # فشلت أيضاً بدون بروكسي، فالمشكلة في الكوكيز
                 return {
-                    'success': False, 
+                    'success': False,
                     'error': f"{r['error']}\n\n💡 <b>ملاحظة:</b> حاولنا بدون بروكسي أيضاً، المشكلة في الكوكيز"
                 }
         else:
             # بدون بروكسي والفشل موجود، إذاً الكوكيز مشكلة
             return r
-    
+
     # نجحت مع البروكسي/بدون بروكسي، استمر
     r = await svc.get_billing_account_id(bm_id, ad_id)
     if not r['success']:
